@@ -1,0 +1,2280 @@
+/*****************************************************************************/
+/*                                                                           */
+/*                                 coptstop.c                                */
+/*                                                                           */
+/*           Optimize operations that take operands via the stack            */
+/*                                                                           */
+/*                                                                           */
+/*                                                                           */
+/* (C) 2001-2019, Ullrich von Bassewitz                                      */
+/*                Roemerstrasse 52                                           */
+/*                D-70794 Filderstadt                                        */
+/* EMail:         uz@cc65.org                                                */
+/*                                                                           */
+/*                                                                           */
+/* This software is provided 'as-is', without any expressed or implied       */
+/* warranty.  In no event will the authors be held liable for any damages    */
+/* arising from the use of this software.                                    */
+/*                                                                           */
+/* Permission is granted to anyone to use this software for any purpose,     */
+/* including commercial applications, and to alter it and redistribute it    */
+/* freely, subject to the following restrictions:                            */
+/*                                                                           */
+/* 1. The origin of this software must not be misrepresented; you must not   */
+/*    claim that you wrote the original software. If you use this software   */
+/*    in a product, an acknowledgment in the product documentation would be  */
+/*    appreciated but is not required.                                       */
+/* 2. Altered source versions must be plainly marked as such, and must not   */
+/*    be misrepresented as being the original software.                      */
+/* 3. This notice may not be removed or altered from any source              */
+/*    distribution.                                                          */
+/*                                                                           */
+/*****************************************************************************/
+
+
+
+#include <stdlib.h>
+
+/* common */
+#include "chartype.h"
+
+/* cc65 */
+#include "codeent.h"
+#include "codeinfo.h"
+#include "codeoptutil.h"
+#include "coptstop.h"
+#include "error.h"
+
+
+
+/*****************************************************************************/
+/*                                   Data                                    */
+/*****************************************************************************/
+
+
+
+/* Structure that describes an optimizer subfunction for a specific op */
+typedef unsigned (*OptFunc) (StackOpData* D);
+typedef int (*PreCondFunc) (const StackOpData* D);
+
+typedef struct OptFuncDesc OptFuncDesc;
+struct OptFuncDesc {
+    const char*         Name;           /* Name of the replaced runtime function */
+    OptFunc             Func;           /* Function pointer */
+    PreCondFunc         PreCond;        /* Precondition predicate pointer */
+};
+
+/* Termination for OptFuncDesc tables */
+#define OPTFUNCDESC_SENTINEL    { 0, 0, 0 }
+
+
+
+/*****************************************************************************/
+/*                                  Helpers                                  */
+/*****************************************************************************/
+
+
+
+static int SameRegAValueAtOp (const StackOpData* D)
+/* Check if Rhs Reg A at OpIndex == Lhs Reg A at PushIndex */
+{
+    CHECK (D->PushEntry != 0 && D->OpEntry != 0);
+
+    return
+        RegValIsKnown (D->PushEntry->RI->In.RegA) &&
+        RegValIsKnown (D->OpEntry->RI->In.RegA) &&
+        D->PushEntry->RI->In.RegA == D->OpEntry->RI->In.RegA;
+}
+
+
+
+static int SameRegXValueAtOp (const StackOpData* D)
+/* Check if Rhs Reg X at OpIndex == Lhs Reg X at PushIndex */
+{
+    CHECK (D->PushEntry != 0 && D->OpEntry != 0);
+
+    return
+        RegValIsKnown (D->PushEntry->RI->In.RegX) &&
+        RegValIsKnown (D->OpEntry->RI->In.RegX) &&
+        D->PushEntry->RI->In.RegX == D->OpEntry->RI->In.RegX;
+}
+
+
+
+static inline int RegIsDirectLoaded (const LoadRegInfo* LRI)
+/* Check if Reg specified by LoadRegInfo is direct-loaded. */
+{
+    /* Must have load insns for Reg, and must be direct */
+    return (LRI->Flags & LI_LOAD_INSN) != 0 &&
+           (LRI->Flags & LI_DIRECT) != 0;
+}
+
+
+
+static inline int RegIsDirectNonStackLoaded (const LoadRegInfo* LRI)
+/* Check if Reg specified by LoadRegInfo is direct-loaded without
+** stack-relative Y-indexing.
+*/
+{
+    /* Note: this is not a precise test. abs,y addressing would also
+    ** require reloading Y.
+    */
+    return (LRI->Flags & (LI_LOAD_INSN | LI_DIRECT | LI_RELOAD_Y)) ==
+           (LI_LOAD_INSN | LI_DIRECT /* no LI_RELOAD_Y */);
+}
+
+
+
+static inline int RegLoadIsRemovable (const LoadRegInfo* LRI)
+/* Check if Reg specified by LoadRegInfo is marked as non-removable. */
+{
+    /* Must have load entry for Reg, which is not marked */
+    return LRI->LoadEntry != 0 &&
+           (LRI->LoadEntry->Flags & CEF_DONT_REMOVE) == 0;
+}
+
+
+
+static inline int LhsIsDirectLoad (const StackOpData* D)
+/* Check if Lhs A/X is direct-loaded. */
+{
+    return RegIsDirectLoaded (&D->Lhs.A) && RegIsDirectLoaded (&D->Lhs.X);
+}
+
+
+
+static inline int RhsIsDirectLoad (const StackOpData* D)
+/* Check if Rhs A/X is direct-loaded. */
+{
+    return RegIsDirectLoaded (&D->Rhs.A) && RegIsDirectLoaded (&D->Rhs.X);
+}
+
+
+
+static inline int LhsIsDirectNonStackLoad (const StackOpData* D)
+/* Check if Lhs A/X is direct-loaded and not stack-relative. */
+{
+    /* Note: this is not a precise test. abs,y addressing would also
+    ** require reloading Y.
+    */
+    return RegIsDirectNonStackLoaded (&D->Lhs.A) &&
+           RegIsDirectNonStackLoaded (&D->Lhs.X);
+}
+
+
+
+static inline int RhsIsDirectNonStackLoad (const StackOpData* D)
+/* Check if Rhs A/X is direct-loaded and not stack-relative. */
+{
+    /* Note: this is not a precise test. abs,y addressing would also
+    ** require reloading Y.
+    */
+    return RegIsDirectNonStackLoaded (&D->Rhs.A) &&
+           RegIsDirectNonStackLoaded (&D->Rhs.X);
+}
+
+
+
+static int RhsIsRemovable (const StackOpData* D)
+/* Check if Rhs A/X is direct-loaded and removable (because Lhs A/X must
+** be in force at operation).
+*/
+{
+    /* Must have direct load insns for Rhs */
+    if (!RhsIsDirectLoad (D)) {
+        return 0; /* Fail */
+    }
+
+    /* Rhs loads must be removable */
+    if (!RegLoadIsRemovable (&D->Rhs.A) || !RegLoadIsRemovable (&D->Rhs.X)) {
+        return 0; /* Fail */
+    }
+
+    /* Special condition: for Rhs to be removable, it must be loaded
+    ** exactly *once*. When multiple loads exists, only the last one would
+    ** be removed, and the Lhs A/X will not be in force at op.
+    */
+    if (D->RhsMultiChg) {
+        return 0; /* Fail */
+    }
+
+    return 1; /* Pass */
+}
+
+
+
+static void UseLhsRegVarLoc (StackOpData* D)
+/* Prepare StackOpData to use the Lhs ZP location. */
+{
+    /* Trying to use a non-ZP var is fatal here. */
+    CHECK (IsRegVar (D));
+
+    /* Use the ZP location directly from Lhs */
+    D->ZPLo = D->Lhs.A.LoadEntry->Arg;
+    D->ZPHi = D->Lhs.X.LoadEntry->Arg;
+}
+
+
+
+static int HaveUnusedTempZPLoc (const StackOpData* D)
+/* Determine if an unused temp ZP location is available. */
+{
+    /* We've tracked the used ZP locations; see if any are unused.
+    ** Note: they must be checked as LO+HI pairs individually.
+    ** This must match the conditions used in ChooseTempZPLoc() exactly,
+    ** but it is a lesser evil than predicate side effects.
+    */
+    return (D->ZPUsage & REG_PTR1) == 0 || (D->ZPUsage & REG_SREG) == 0 ||
+           (D->ZPUsage & REG_PTR2) == 0;
+}
+
+
+
+static void ChooseTempZPLoc (StackOpData* D)
+/* Determine the temp ZP location to use from ZP usage flags.
+** Note: one not being available is a fatal condition here.
+*/
+{
+    /* Determine the zero page locations to use. We've tracked the used
+    ** ZP locations, so try to find some for us that are unused.
+    */
+    if ((D->ZPUsage & REG_PTR1) == 0) {
+        D->ZPLo = "ptr1";
+        D->ZPHi = "ptr1+1";
+    } else if ((D->ZPUsage & REG_SREG) == 0) {
+        D->ZPLo = "sreg";
+        D->ZPHi = "sreg+1";
+    } else if ((D->ZPUsage & REG_PTR2) == 0) {
+        D->ZPLo = "ptr2";
+        D->ZPHi = "ptr2+1";
+    } else {
+        /* No registers available */
+        Internal ("No temp ZP locations available. Was pre-check peformed?");
+    }
+}
+
+
+
+/*****************************************************************************/
+/*                  Precondition Predicates                                  */
+/*****************************************************************************/
+
+
+
+static int CanUseRegVarOrTempZP (const StackOpData* D)
+/* Precondition: either the operand is a register (ZP) var, or a temp
+** ZP location is available to store its value.
+*/
+{
+    return IsRegVar (D) || HaveUnusedTempZPLoc (D);
+}
+
+
+
+/* ### Note: This is a temporary, artificially-limited precondition reproducing
+** the original (OP_RHS_REMOVE_DIRECT | OP_RHS_LOAD_DIRECT) evaluation,
+** but not useful otherwise.
+*/
+static int CanUseRemovableRhsWithTempZP (const StackOpData* D)
+/* Precondition: Rhs is direct-loaded and removable (because Lhs A/X must
+** be in force at operation), and a temp ZP location is available.
+*/
+{
+    return RhsIsDirectLoad (D) && RhsIsRemovable (D) && HaveUnusedTempZPLoc (D);
+}
+
+
+
+/* ### Note: This is a temporary, artificially-limited precondition reproducing
+** the original (OP_LR_INTERCHANGE | OP_RHS_REMOVE_DIRECT) evaluation,
+** but not useful otherwise.
+*/
+static int CanUseDirectWithRemovableRhsAndTempZP (const StackOpData* D)
+/* Precondition: Lhs is direct-loaded, or Rhs is direct-loaded, and
+** Rhs is removable, and a temp ZP location is available.
+*/
+{
+    return (LhsIsDirectLoad (D) || RhsIsDirectLoad (D)) &&
+           RhsIsRemovable (D) && HaveUnusedTempZPLoc (D);
+}
+
+
+
+static int MustHaveTempZP (const StackOpData* D)
+/* Precondition: a temp ZP location must be available in all cases */
+{
+    return HaveUnusedTempZPLoc (D);
+}
+
+
+
+static int WithAXlt100CanUseRegVarOrTempZP (const StackOpData* D)
+/* Precondition: When X is 0 and A is known at op, either the operand is a
+** register (ZP) var, or a temp ZP location is available to store its value.
+*/
+{
+    CHECK (D->OpEntry != 0);
+
+    return CanUseRegVarOrTempZP (D) &&
+           /* X is 0 at op, and A is known at op */
+           (D->OpEntry->RI->In.RegX == 0) &&
+           RegValIsKnown (D->OpEntry->RI->In.RegA);
+}
+
+
+
+static int WithUnusedACanUseRegVarOrTempZP (const StackOpData* D)
+/* Precondition: either the operand is a register (ZP) var, or a temp ZP
+** location is available to store its value. Reg A must not be used later
+** (because it is changed).
+*/
+{
+    return (IsRegVar (D) || HaveUnusedTempZPLoc (D)) &&
+           !RegAUsed (D->Code, D->OpIndex + 1);
+}
+
+
+
+static int WithSameXMustHaveTempZP (const StackOpData* D)
+/* Precondition: When Rhs X == Lhs X, any operand will do because a temp
+** ZP location will be used. Used by subopts primarily targeting temp
+** ZP with AddStoreLhsA() or similar.
+*/
+{
+    return SameRegXValueAtOp (D) && HaveUnusedTempZPLoc (D);
+}
+
+
+
+/* ### Note: This is a temporary, artificially-limited precondition reproducing
+** the original (OP_RHS_REMOVE_DIRECT | OP_RHS_LOAD_DIRECT) evaluation
+** for A-only subopts, but not useful otherwise.
+*/
+static int WithSameXCanUseRemovableRhsWithTempZP (const StackOpData* D)
+/* Precondition: When Rhs X == Lhs X, Rhs is direct-loaded and removable,
+** and a temp ZP location is available.
+*/
+{
+    return SameRegXValueAtOp (D) && RhsIsDirectLoad (D) &&
+           RhsIsRemovable (D) && HaveUnusedTempZPLoc (D);
+}
+
+
+
+/*****************************************************************************/
+/*                       Actual optimization functions                       */
+/*****************************************************************************/
+
+
+
+static unsigned Opt_toseqax_tosneax (StackOpData* D, const char* BoolTransformer)
+/* Optimize the toseqax and tosneax sequences. */
+{
+    CodeEntry*  X;
+    CodeLabel* L;
+
+    /* Create a call to the boolean transformer function and a label for this
+    ** insn. This is needed for all variants. Other insns are inserted *before*
+    ** the call.
+    */
+    X = NewCodeEntry (OP65_JSR, AM65_ABS, BoolTransformer, 0, D->OpEntry->LI);
+    InsertEntry (D, X, D->OpIndex + 1);
+    L = CS_GenLabel (D->Code, X);
+
+    /* If the lhs is direct (but not stack relative), encode compares with lhs
+    ** effectively reverting the order (which doesn't matter for ==).
+    */
+    if (LhsIsDirectNonStackLoad (D)) {
+
+        CodeEntry* LoadX = D->Lhs.X.LoadEntry;
+        CodeEntry* LoadA = D->Lhs.A.LoadEntry;
+
+        D->IP = D->OpIndex+1;
+
+        /* cpx */
+        X = NewCodeEntry (OP65_CPX, LoadX->AM, LoadX->Arg, 0, D->OpEntry->LI);
+        InsertEntry (D, X, D->IP++);
+
+        /* bne L */
+        X = NewCodeEntry (OP65_BNE, AM65_BRA, L->Name, L, D->OpEntry->LI);
+        InsertEntry (D, X, D->IP++);
+
+        /* cmp */
+        X = NewCodeEntry (OP65_CMP, LoadA->AM, LoadA->Arg, 0, D->OpEntry->LI);
+        InsertEntry (D, X, D->IP++);
+
+        /* Lhs load entries can be removed if not used later */
+        D->Lhs.X.Flags |= LI_REMOVE;
+        D->Lhs.A.Flags |= LI_REMOVE;
+
+    } else if (RhsIsDirectNonStackLoad (D) && RhsIsRemovable (D)) {
+
+        CodeEntry* LoadX = D->Rhs.X.LoadEntry;
+        CodeEntry* LoadA = D->Rhs.A.LoadEntry;
+
+        D->IP = D->OpIndex+1;
+
+        /* cpx */
+        X = NewCodeEntry (OP65_CPX, LoadX->AM, LoadX->Arg, 0, D->OpEntry->LI);
+        InsertEntry (D, X, D->IP++);
+
+        /* bne L */
+        X = NewCodeEntry (OP65_BNE, AM65_BRA, L->Name, L, D->OpEntry->LI);
+        InsertEntry (D, X, D->IP++);
+
+        /* cmp */
+        X = NewCodeEntry (OP65_CMP, LoadA->AM, LoadA->Arg, 0, D->OpEntry->LI);
+        InsertEntry (D, X, D->IP++);
+
+        /* Rhs load entries must be removed because Lhs must be in effect */
+        D->Rhs.X.Flags |= (LI_REMOVE | LI_MUST_REMOVE);
+        D->Rhs.A.Flags |= (LI_REMOVE | LI_MUST_REMOVE);
+
+    } else if (RhsIsRemovable (D)) {
+
+        D->IP = D->OpIndex+1;
+
+        /* Add operand for low byte */
+        AddOpLow (D, OP65_CMP, &D->Rhs);
+
+        /* bne L */
+        X = NewCodeEntry (OP65_BNE, AM65_BRA, L->Name, L, D->OpEntry->LI);
+        InsertEntry (D, X, D->IP++);
+
+        /* Add operand for high byte */
+        AddOpHigh (D, OP65_CMP, &D->Rhs, 0);
+
+        /* Rhs load entries must be removed because Lhs must be in effect */
+        D->Rhs.X.Flags |= LI_MUST_REMOVE;
+        D->Rhs.A.Flags |= LI_MUST_REMOVE;
+
+    } else {
+
+        /* Implement the op via a temp ZP location */
+        /* HaveUnusedTempZPLoc precondition must have been met */
+        ChooseTempZPLoc (D);
+
+        /* Save lhs into zeropage, then compare */
+        AddStoreLhsX (D);
+        AddStoreLhsA (D);
+
+        D->IP = D->OpIndex+1;
+
+        /* cpx */
+        X = NewCodeEntry (OP65_CPX, AM65_ZP, D->ZPHi, 0, D->OpEntry->LI);
+        InsertEntry (D, X, D->IP++);
+
+        /* bne L */
+        X = NewCodeEntry (OP65_BNE, AM65_BRA, L->Name, L, D->OpEntry->LI);
+        InsertEntry (D, X, D->IP++);
+
+        /* cmp */
+        X = NewCodeEntry (OP65_CMP, AM65_ZP, D->ZPLo, 0, D->OpEntry->LI);
+        InsertEntry (D, X, D->IP++);
+
+    }
+
+    /* Remove the push and the call to the tosgeax function */
+    RemoveRemainders (D);
+
+    /* We changed the sequence */
+    return 1;
+}
+
+
+
+static unsigned Opt_tosshift (StackOpData* D, const char* Name)
+/* Optimize shift sequences. */
+{
+    CodeEntry*  X;
+
+    /* If the lhs is direct (but not stack relative), we can just reload the
+    ** data later.
+    */
+    if (LhsIsDirectNonStackLoad (D)) {
+
+        CodeEntry* LoadX = D->Lhs.X.LoadEntry;
+        CodeEntry* LoadA = D->Lhs.A.LoadEntry;
+
+        /* Inline the shift */
+        D->IP = D->OpIndex+1;
+
+        /* tay */
+        X = NewCodeEntry (OP65_TAY, AM65_IMP, 0, 0, D->OpEntry->LI);
+        InsertEntry (D, X, D->IP++);
+
+        /* lda */
+        X = NewCodeEntry (OP65_LDA, LoadA->AM, LoadA->Arg, 0, D->OpEntry->LI);
+        InsertEntry (D, X, D->IP++);
+
+        /* ldx */
+        X = NewCodeEntry (OP65_LDX, LoadX->AM, LoadX->Arg, 0, D->OpEntry->LI);
+        InsertEntry (D, X, D->IP++);
+
+        /* Lhs load entries can be removed if not used later */
+        D->Lhs.X.Flags |= LI_REMOVE;
+        D->Lhs.A.Flags |= LI_REMOVE;
+
+    } else {
+
+        /* Implement the op via a temp ZP location */
+        /* HaveUnusedTempZPLoc precondition must have been met */
+        ChooseTempZPLoc (D);
+
+        /* Save lhs into zeropage and reload later */
+        AddStoreLhsX (D);
+        AddStoreLhsA (D);
+
+        /* Be sure to setup IP after adding the stores, otherwise it will get
+        ** messed up.
+        */
+        D->IP = D->OpIndex+1;
+
+        /* tay */
+        X = NewCodeEntry (OP65_TAY, AM65_IMP, 0, 0, D->OpEntry->LI);
+        InsertEntry (D, X, D->IP++);
+
+        /* lda zp */
+        X = NewCodeEntry (OP65_LDA, AM65_ZP, D->ZPLo, 0, D->OpEntry->LI);
+        InsertEntry (D, X, D->IP++);
+
+        /* ldx zp+1 */
+        X = NewCodeEntry (OP65_LDX, AM65_ZP, D->ZPHi, 0, D->OpEntry->LI);
+        InsertEntry (D, X, D->IP++);
+
+    }
+
+    /* jsr shlaxy/aslaxy/whatever */
+    X = NewCodeEntry (OP65_JSR, AM65_ABS, Name, 0, D->OpEntry->LI);
+    InsertEntry (D, X, D->IP++);
+
+    /* Remove the push and the call to the shift function */
+    RemoveRemainders (D);
+
+    /* We changed the sequence */
+    return 1;
+}
+
+
+
+static unsigned Opt___bzero (StackOpData* D)
+/* Optimize the __bzero sequence */
+{
+    CodeEntry*  X;
+    const char* Arg;
+    CodeLabel*  L;
+
+    /* Check if we're using a register variable */
+    if (IsRegVar (D)) {
+        /* Can use the Lhs ZP var directly here */
+        UseLhsRegVarLoc (D);
+    } else {
+        /* HaveUnusedTempZPLoc precondition must have been met */
+        ChooseTempZPLoc (D);
+
+        /* Store the value into the zeropage instead of pushing it */
+        AddStoreLhsX (D);
+        AddStoreLhsA (D);
+    }
+
+    /* If the return value of __bzero is used, we have to add code to reload
+    ** a/x from the pointer variable.
+    */
+    if (RegAXUsed (D->Code, D->OpIndex+1)) {
+        X = NewCodeEntry (OP65_LDA, AM65_ZP, D->ZPLo, 0, D->OpEntry->LI);
+        InsertEntry (D, X, D->OpIndex+1);
+        X = NewCodeEntry (OP65_LDX, AM65_ZP, D->ZPHi, 0, D->OpEntry->LI);
+        InsertEntry (D, X, D->OpIndex+2);
+    }
+
+    /* X is always zero, A contains the size of the data area to zero.
+    ** Note: A may be zero, in which case the operation is null op.
+    */
+    if (D->OpEntry->RI->In.RegA != 0) {
+
+        /* lda #$00 */
+        X = NewCodeEntry (OP65_LDA, AM65_IMM, "$00", 0, D->OpEntry->LI);
+        InsertEntry (D, X, D->OpIndex+1);
+
+        /* The value of A is known */
+        if (D->OpEntry->RI->In.RegA <= 0x81) {
+
+            /* Loop using the sign bit */
+
+            /* ldy #count-1 */
+            Arg = MakeHexArg (D->OpEntry->RI->In.RegA - 1);
+            X = NewCodeEntry (OP65_LDY, AM65_IMM, Arg, 0, D->OpEntry->LI);
+            InsertEntry (D, X, D->OpIndex+2);
+
+            /* L: sta (zp),y */
+            X = NewCodeEntry (OP65_STA, AM65_ZP_INDY, D->ZPLo, 0, D->OpEntry->LI);
+            InsertEntry (D, X, D->OpIndex+3);
+            L = CS_GenLabel (D->Code, X);
+
+            /* dey */
+            X = NewCodeEntry (OP65_DEY, AM65_IMP, 0, 0, D->OpEntry->LI);
+            InsertEntry (D, X, D->OpIndex+4);
+
+            /* bpl L */
+            X = NewCodeEntry (OP65_BPL, AM65_BRA, L->Name, L, D->OpEntry->LI);
+            InsertEntry (D, X, D->OpIndex+5);
+
+        } else {
+
+            /* Loop using an explicit compare */
+
+            /* ldy #$00 */
+            X = NewCodeEntry (OP65_LDY, AM65_IMM, "$00", 0, D->OpEntry->LI);
+            InsertEntry (D, X, D->OpIndex+2);
+
+            /* L: sta (zp),y */
+            X = NewCodeEntry (OP65_STA, AM65_ZP_INDY, D->ZPLo, 0, D->OpEntry->LI);
+            InsertEntry (D, X, D->OpIndex+3);
+            L = CS_GenLabel (D->Code, X);
+
+            /* iny */
+            X = NewCodeEntry (OP65_INY, AM65_IMP, 0, 0, D->OpEntry->LI);
+            InsertEntry (D, X, D->OpIndex+4);
+
+            /* cpy #count */
+            Arg = MakeHexArg (D->OpEntry->RI->In.RegA);
+            X = NewCodeEntry (OP65_CPY, AM65_IMM, Arg, 0, D->OpEntry->LI);
+            InsertEntry (D, X, D->OpIndex+5);
+
+            /* bne L */
+            X = NewCodeEntry (OP65_BNE, AM65_BRA, L->Name, L, D->OpEntry->LI);
+            InsertEntry (D, X, D->OpIndex+6);
+        }
+
+    }
+
+    /* Remove the push and the call to the __bzero function */
+    RemoveRemainders (D);
+
+    /* We changed the sequence */
+    return 1;
+}
+
+
+
+static unsigned Opt_staspidx (StackOpData* D)
+/* Optimize the staspidx sequence */
+{
+    CodeEntry* X;
+
+    /* Check if we're using a register variable */
+    if (IsRegVar (D)) {
+        /* Can use the Lhs ZP var directly here */
+        UseLhsRegVarLoc (D);
+    } else {
+        /* HaveUnusedTempZPLoc precondition must have been met */
+        ChooseTempZPLoc (D);
+
+        /* Store the value into the zeropage instead of pushing it */
+        AddStoreLhsX (D);
+        AddStoreLhsA (D);
+    }
+
+    /* Replace the store subroutine call by a direct op */
+    X = NewCodeEntry (OP65_STA, AM65_ZP_INDY, D->ZPLo, 0, D->OpEntry->LI);
+    InsertEntry (D, X, D->OpIndex+1);
+
+    /* Note: We have not flagged any loads for removal. If any are unnecessary,
+    **  other optimizers will remove them.
+    */
+    /* Remove the push and the call to the staspidx function */
+    RemoveRemainders (D);
+
+    /* We changed the sequence */
+    return 1;
+}
+
+
+
+static unsigned Opt_staxspidx (StackOpData* D)
+/* Optimize the staxspidx sequence */
+{
+    CodeEntry* X;
+    const char* Arg = 0;
+
+    /* Check if we're using a register variable */
+    if (IsRegVar (D)) {
+        /* Can use the Lhs ZP var directly here */
+        UseLhsRegVarLoc (D);
+    } else {
+        /* HaveUnusedTempZPLoc precondition must have been met */
+        ChooseTempZPLoc (D);
+
+        /* Store the value into the zeropage instead of pushing it */
+        AddStoreLhsX (D);
+        AddStoreLhsA (D);
+    }
+
+    /* Note: Earlier, this subopt demanded for REG_AX to not be used later.
+    ** X is unchanged by the code here, so only REG_A must not be used.
+    ** Note 2: Should be updated to common D->IP++ syntax.
+    */
+
+    /* Inline the store */
+
+    /* sta (zp),y */
+    X = NewCodeEntry (OP65_STA, AM65_ZP_INDY, D->ZPLo, 0, D->OpEntry->LI);
+    InsertEntry (D, X, D->OpIndex+1);
+
+    if (RegValIsKnown (D->OpEntry->RI->In.RegY)) {
+        /* Value of Y is known */
+        Arg = MakeHexArg (D->OpEntry->RI->In.RegY + 1);
+        X = NewCodeEntry (OP65_LDY, AM65_IMM, Arg, 0, D->OpEntry->LI);
+    } else {
+        X = NewCodeEntry (OP65_INY, AM65_IMP, 0, 0, D->OpEntry->LI);
+    }
+    InsertEntry (D, X, D->OpIndex+2);
+
+    /* ### TODO: We could do a PHA here to save A if it is used, and remove
+    ** the "A not used" precondition entirely.
+    */
+
+    if (RegValIsKnown (D->OpEntry->RI->In.RegX)) {
+        /* Value of X is known */
+        Arg = MakeHexArg (D->OpEntry->RI->In.RegX);
+        X = NewCodeEntry (OP65_LDA, AM65_IMM, Arg, 0, D->OpEntry->LI);
+    } else {
+        /* Value unknown */
+        X = NewCodeEntry (OP65_TXA, AM65_IMP, 0, 0, D->OpEntry->LI);
+    }
+    InsertEntry (D, X, D->OpIndex+3);
+
+    /* ### TODO: We could do a PLA here to restore A if it is used, and remove
+    ** the "A not used" precondition entirely.
+    */
+
+    /* sta (zp),y */
+    X = NewCodeEntry (OP65_STA, AM65_ZP_INDY, D->ZPLo, 0, D->OpEntry->LI);
+    InsertEntry (D, X, D->OpIndex+4);
+
+    /* If we remove staxspidx, we must restore the Y register to what the
+    ** function would return.
+    */
+    if (RegValIsKnown (D->OpEntry->RI->In.RegY)) {
+        Arg = MakeHexArg (D->OpEntry->RI->In.RegY);
+        X = NewCodeEntry (OP65_LDY, AM65_IMM, Arg, 0, D->OpEntry->LI);
+    } else {
+        X = NewCodeEntry (OP65_DEY, AM65_IMP, 0, 0, D->OpEntry->LI);
+    }
+    InsertEntry (D, X, D->OpIndex+5);
+
+    /* Note: We have not flagged any loads for removal. If any are unnecessary,
+    **  other optimizers will remove them.
+    */
+    /* Remove the push and the call to the staxspidx function */
+    RemoveRemainders (D);
+
+    /* We changed the sequence */
+    return 1;
+}
+
+
+
+static unsigned Opt_tosaddax (StackOpData* D)
+/* Optimize the tosaddax sequence */
+{
+    CodeEntry*  X;
+    CodeEntry*  N;
+
+    /* We need the entry behind the add */
+    CHECK (D->NextEntry != 0);
+
+    /* Because of HaveUnusedTempZPLoc precondition in all cases */
+    ChooseTempZPLoc (D);
+
+    /* Check if the X register is known and zero when the add is done, and
+    ** if the add is followed by
+    **
+    **  ldy     #$00
+    **  jsr     ldauidx         ; or ldaidx
+    **
+    ** If this is true, the addition does actually add an offset to a pointer
+    ** before it is dereferenced. Since both subroutines take an offset in Y,
+    ** we can pass the offset (instead of #$00) and remove the addition
+    ** alltogether.
+    */
+    if (D->OpEntry->RI->In.RegX == 0                            &&
+        D->NextEntry->OPC == OP65_LDY                           &&
+        CE_IsKnownImm (D->NextEntry, 0)                         &&
+        !CE_HasLabel (D->NextEntry)                             &&
+        (N = CS_GetNextEntry (D->Code, D->OpIndex + 1)) != 0    &&
+        (CE_IsCallTo (N, "ldauidx")                     ||
+         CE_IsCallTo (N, "ldaidx"))) {
+
+        int Signed = (strcmp (N->Arg, "ldaidx") == 0);
+
+        /* Store the value into the zeropage instead of pushing it */
+        AddStoreLhsX (D);
+        AddStoreLhsA (D);
+
+        /* Replace the ldy by a tay. Be sure to create the new entry before
+        ** deleting the ldy, since we will reference the line info from this
+        ** insn.
+        */
+        X = NewCodeEntry (OP65_TAY, AM65_IMP, 0, 0, D->NextEntry->LI);
+        DelEntry (D, D->OpIndex + 1);
+        InsertEntry (D, X, D->OpIndex + 1);
+
+        /* Replace the call to ldaidx/ldauidx. Since X is already zero, and
+        ** the ptr is in the zero page location, we just need to load from
+        ** the pointer, and fix X in case of ldaidx.
+        */
+        X = NewCodeEntry (OP65_LDA, AM65_ZP_INDY, D->ZPLo, 0, N->LI);
+        DelEntry (D, D->OpIndex + 2);
+        InsertEntry (D, X, D->OpIndex + 2);
+        if (Signed) {
+
+            CodeLabel* L;
+
+            /* Add sign extension - N is unused now */
+            N = CS_GetNextEntry (D->Code, D->OpIndex + 2);
+            CHECK (N != 0);
+            L = CS_GenLabel (D->Code, N);
+
+            X = NewCodeEntry (OP65_BPL, AM65_BRA, L->Name, L, X->LI);
+            InsertEntry (D, X, D->OpIndex + 3);
+
+            X = NewCodeEntry (OP65_DEX, AM65_IMP, 0, 0, X->LI);
+            InsertEntry (D, X, D->OpIndex + 4);
+        }
+
+    } else {
+
+        /* Store the value into the zeropage instead of pushing it */
+        ReplacePushByStore (D);
+
+        /* Inline the add */
+        D->IP = D->OpIndex+1;
+
+        /* clc */
+        X = NewCodeEntry (OP65_CLC, AM65_IMP, 0, 0, D->OpEntry->LI);
+        InsertEntry (D, X, D->IP++);
+
+        /* Low byte */
+        AddOpLow (D, OP65_ADC, &D->Lhs);
+
+        /* High byte */
+        if (D->PushEntry->RI->In.RegX == 0) {
+
+            /* The high byte is the value in X plus the carry */
+            CodeLabel* L = CS_GenLabel (D->Code, D->NextEntry);
+
+            /* bcc L */
+            X = NewCodeEntry (OP65_BCC, AM65_BRA, L->Name, L, D->OpEntry->LI);
+            InsertEntry (D, X, D->IP++);
+
+            /* inx */
+            X = NewCodeEntry (OP65_INX, AM65_IMP, 0, 0, D->OpEntry->LI);
+            InsertEntry (D, X, D->IP++);
+
+        } else if (D->OpEntry->RI->In.RegX == 0                         &&
+                   (RegValIsKnown (D->PushEntry->RI->In.RegX)   ||
+                    (D->Lhs.X.Flags & LI_RELOAD_Y) == 0)) {
+
+            /* The high byte is that of the first operand plus carry */
+            CodeLabel* L;
+            if (RegValIsKnown (D->PushEntry->RI->In.RegX)) {
+                /* Value of first op high byte is known */
+                const char* Arg = MakeHexArg (D->PushEntry->RI->In.RegX);
+                X = NewCodeEntry (OP65_LDX, AM65_IMM, Arg, 0, D->OpEntry->LI);
+            } else {
+                /* Value of first op high byte is unknown. Load from ZP or
+                ** original storage.
+                */
+                if (RegIsDirectLoaded (&D->Lhs.X)) {
+                    CodeEntry* LoadX = D->Lhs.X.LoadEntry;
+                    X = NewCodeEntry (OP65_LDX, LoadX->AM, LoadX->Arg, 0, D->OpEntry->LI);
+                } else {
+                    CHECK (D->ZPHi != 0);
+                    X = NewCodeEntry (OP65_LDX, AM65_ZP, D->ZPHi, 0, D->OpEntry->LI);
+                }
+            }
+            InsertEntry (D, X, D->IP++);
+
+            /* bcc label */
+            L = CS_GenLabel (D->Code, D->NextEntry);
+            X = NewCodeEntry (OP65_BCC, AM65_BRA, L->Name, L, D->OpEntry->LI);
+            InsertEntry (D, X, D->IP++);
+
+            /* inx */
+            X = NewCodeEntry (OP65_INX, AM65_IMP, 0, 0, D->OpEntry->LI);
+            InsertEntry (D, X, D->IP++);
+        } else {
+            /* High byte is unknown */
+            AddOpHigh (D, OP65_ADC, &D->Lhs, 1);
+        }
+    }
+
+    /* Remove the push and the call to the tosaddax function */
+    RemoveRemainders (D);
+
+    /* We changed the sequence */
+    return 1;
+}
+
+
+
+static unsigned Opt_tosandax (StackOpData* D)
+/* Optimize the tosandax sequence */
+{
+    /* HaveUnusedTempZPLoc precondition must have been met */
+    ChooseTempZPLoc (D);
+
+    /* Store the value into the zeropage instead of pushing it */
+    ReplacePushByStore (D);
+
+    /* Inline the and, low byte */
+    D->IP = D->OpIndex + 1;
+    AddOpLow (D, OP65_AND, &D->Lhs);
+
+    /* High byte */
+    AddOpHigh (D, OP65_AND, &D->Lhs, 1);
+
+    /* Remove the push and the call to the tosandax function */
+    RemoveRemainders (D);
+
+    /* We changed the sequence */
+    return 1;
+}
+
+
+
+static unsigned Opt_tosaslax (StackOpData* D)
+/* Optimize the tosaslax sequence */
+{
+    return Opt_tosshift (D, "aslaxy");
+}
+
+
+
+static unsigned Opt_tosasrax (StackOpData* D)
+/* Optimize the tosasrax sequence */
+{
+    return Opt_tosshift (D, "asraxy");
+}
+
+
+
+static unsigned Opt_toseqax (StackOpData* D)
+/* Optimize the toseqax sequence */
+{
+    return Opt_toseqax_tosneax (D, "booleq");
+}
+
+
+
+static unsigned Opt_tosgeax (StackOpData* D)
+/* Optimize the tosgeax sequence */
+{
+    CodeEntry*  X;
+    CodeLabel* L;
+
+    /* Because of CanUseRemovableRhs */
+    CHECK (RhsIsRemovable (D));
+
+    /* Inline the sbc */
+    D->IP = D->OpIndex+1;
+
+    /* Add code for low operand */
+    AddOpLow (D, OP65_CMP, &D->Rhs);
+
+    /* Add code for high operand */
+    AddOpHigh (D, OP65_SBC, &D->Rhs, 0);
+
+    /* eor #$80 */
+    X = NewCodeEntry (OP65_EOR, AM65_IMM, "$80", 0, D->OpEntry->LI);
+    InsertEntry (D, X, D->IP++);
+
+    /* asl a */
+    X = NewCodeEntry (OP65_ASL, AM65_ACC, "a", 0, D->OpEntry->LI);
+    InsertEntry (D, X, D->IP++);
+    L = CS_GenLabel (D->Code, X);
+
+    /* Insert a bvs L before the eor insn */
+    X = NewCodeEntry (OP65_BVS, AM65_BRA, L->Name, L, D->OpEntry->LI);
+    InsertEntry (D, X, D->IP - 2);
+    ++D->IP;
+
+    /* lda #$00 */
+    X = NewCodeEntry (OP65_LDA, AM65_IMM, "$00", 0, D->OpEntry->LI);
+    InsertEntry (D, X, D->IP++);
+
+    /* ldx #$00 */
+    X = NewCodeEntry (OP65_LDX, AM65_IMM, "$00", 0, D->OpEntry->LI);
+    InsertEntry (D, X, D->IP++);
+
+    /* rol a */
+    X = NewCodeEntry (OP65_ROL, AM65_ACC, "a", 0, D->OpEntry->LI);
+    InsertEntry (D, X, D->IP++);
+
+    /* Rhs load entries must be removed because Lhs must be in effect */
+    D->Rhs.X.Flags |= LI_MUST_REMOVE;
+    D->Rhs.A.Flags |= LI_MUST_REMOVE;
+
+    /* Remove the push and the call to the tosgeax function */
+    RemoveRemainders (D);
+
+    /* We changed the sequence */
+    return 1;
+}
+
+
+
+static unsigned Opt_tosltax (StackOpData* D)
+/* Optimize the tosltax sequence */
+{
+    CodeEntry*  X;
+    CodeLabel* L;
+
+    /* Because of CanUseRemovableRhs */
+    CHECK (RhsIsRemovable (D));
+
+    /* Inline the compare */
+    D->IP = D->OpIndex+1;
+
+    /* Add code for low operand */
+    AddOpLow (D, OP65_CMP, &D->Rhs);
+
+    /* Add code for high operand */
+    AddOpHigh (D, OP65_SBC, &D->Rhs, 0);
+
+    /* eor #$80 */
+    X = NewCodeEntry (OP65_EOR, AM65_IMM, "$80", 0, D->OpEntry->LI);
+    InsertEntry (D, X, D->IP++);
+
+    /* asl a */
+    X = NewCodeEntry (OP65_ASL, AM65_ACC, "a", 0, D->OpEntry->LI);
+    InsertEntry (D, X, D->IP++);
+    L = CS_GenLabel (D->Code, X);
+
+    /* Insert a bvc L before the eor insn */
+    X = NewCodeEntry (OP65_BVC, AM65_BRA, L->Name, L, D->OpEntry->LI);
+    InsertEntry (D, X, D->IP - 2);
+    ++D->IP;
+
+    /* lda #$00 */
+    X = NewCodeEntry (OP65_LDA, AM65_IMM, "$00", 0, D->OpEntry->LI);
+    InsertEntry (D, X, D->IP++);
+
+    /* ldx #$00 */
+    X = NewCodeEntry (OP65_LDX, AM65_IMM, "$00", 0, D->OpEntry->LI);
+    InsertEntry (D, X, D->IP++);
+
+    /* rol a */
+    X = NewCodeEntry (OP65_ROL, AM65_ACC, "a", 0, D->OpEntry->LI);
+    InsertEntry (D, X, D->IP++);
+
+    /* Rhs load entries must be removed because Lhs must be in effect */
+    D->Rhs.X.Flags |= LI_MUST_REMOVE;
+    D->Rhs.A.Flags |= LI_MUST_REMOVE;
+
+    /* Remove the push and the call to the tosltax function */
+    RemoveRemainders (D);
+
+    /* We changed the sequence */
+    return 1;
+}
+
+
+
+static unsigned Opt_tosneax (StackOpData* D)
+/* Optimize the tosneax sequence */
+{
+    return Opt_toseqax_tosneax (D, "boolne");
+}
+
+
+
+static unsigned Opt_tosorax (StackOpData* D)
+/* Optimize the tosorax sequence */
+{
+    /* HaveUnusedTempZPLoc precondition must have been met */
+    ChooseTempZPLoc (D);
+
+    /* Store the value into the zeropage instead of pushing it */
+    ReplacePushByStore (D);
+
+    /* Inline the or, low byte */
+    D->IP = D->OpIndex + 1;
+    AddOpLow (D, OP65_ORA, &D->Lhs);
+
+    /* High byte */
+    AddOpHigh (D, OP65_ORA, &D->Lhs, 1);
+
+    /* Remove the push and the call to the tosorax function */
+    RemoveRemainders (D);
+
+    /* We changed the sequence */
+    return 1;
+}
+
+
+
+static unsigned Opt_tosshlax (StackOpData* D)
+/* Optimize the tosshlax sequence */
+{
+    return Opt_tosshift (D, "shlaxy");
+}
+
+
+
+static unsigned Opt_tosshrax (StackOpData* D)
+/* Optimize the tosshrax sequence */
+{
+    return Opt_tosshift (D, "shraxy");
+}
+
+
+
+static unsigned Opt_tossubax (StackOpData* D)
+/* Optimize the tossubax sequence. Note: subtraction is not commutative! */
+{
+    CodeEntry*  X;
+
+    /* Because of CanUseRemovableRhs */
+    CHECK (RhsIsRemovable (D));
+
+    /* Inline the sbc */
+    D->IP = D->OpIndex+1;
+
+    /* sec */
+    X = NewCodeEntry (OP65_SEC, AM65_IMP, 0, 0, D->OpEntry->LI);
+    InsertEntry (D, X, D->IP++);
+
+    /* Add code for low operand */
+    AddOpLow (D, OP65_SBC, &D->Rhs);
+
+    /* Add code for high operand */
+    AddOpHigh (D, OP65_SBC, &D->Rhs, 1);
+
+    /* Rhs load entries must be removed because Lhs must be in effect */
+    D->Rhs.X.Flags |= LI_MUST_REMOVE;
+    D->Rhs.A.Flags |= LI_MUST_REMOVE;
+
+    /* Remove the push and the call to the tossubax function */
+    RemoveRemainders (D);
+
+    /* We changed the sequence */
+    return 1;
+}
+
+
+
+static unsigned Opt_tosugeax (StackOpData* D)
+/* Optimize the tosugeax sequence */
+{
+    CodeEntry*  X;
+
+    /* Because of CanUseRemovableRhs */
+    CHECK (RhsIsRemovable (D));
+
+    /* Inline the sbc */
+    D->IP = D->OpIndex+1;
+
+    /* Add code for low operand */
+    AddOpLow (D, OP65_CMP, &D->Rhs);
+
+    /* Add code for high operand */
+    AddOpHigh (D, OP65_SBC, &D->Rhs, 0);
+
+    /* lda #$00 */
+    X = NewCodeEntry (OP65_LDA, AM65_IMM, "$00", 0, D->OpEntry->LI);
+    InsertEntry (D, X, D->IP++);
+
+    /* ldx #$00 */
+    X = NewCodeEntry (OP65_LDX, AM65_IMM, "$00", 0, D->OpEntry->LI);
+    InsertEntry (D, X, D->IP++);
+
+    /* rol a */
+    X = NewCodeEntry (OP65_ROL, AM65_ACC, "a", 0, D->OpEntry->LI);
+    InsertEntry (D, X, D->IP++);
+
+    /* Rhs load entries must be removed because Lhs must be in effect */
+    D->Rhs.X.Flags |= LI_MUST_REMOVE;
+    D->Rhs.A.Flags |= LI_MUST_REMOVE;
+
+    /* Remove the push and the call to the tosugeax function */
+    RemoveRemainders (D);
+
+    /* We changed the sequence */
+    return 1;
+}
+
+
+
+static unsigned Opt_tosugtax (StackOpData* D)
+/* Optimize the tosugtax sequence */
+{
+    CodeEntry*  X;
+
+    /* Because of CanUseRemovableRhs */
+    CHECK (RhsIsRemovable (D));
+
+    /* Inline the sbc */
+    D->IP = D->OpIndex+1;
+
+    /* sec */
+    X = NewCodeEntry (OP65_SEC, AM65_IMP, 0, 0, D->OpEntry->LI);
+    InsertEntry (D, X, D->IP++);
+
+    /* Add code for low operand */
+    AddOpLow (D, OP65_SBC, &D->Rhs);
+
+    /* We need the zero flag, so remember the immediate result */
+    X = NewCodeEntry (OP65_STA, AM65_ZP, "tmp1", 0, D->OpEntry->LI);
+    InsertEntry (D, X, D->IP++);
+
+    /* Add code for high operand */
+    AddOpHigh (D, OP65_SBC, &D->Rhs, 0);
+
+    /* Set Z flag */
+    X = NewCodeEntry (OP65_ORA, AM65_ZP, "tmp1", 0, D->OpEntry->LI);
+    InsertEntry (D, X, D->IP++);
+
+    /* Transform to boolean */
+    X = NewCodeEntry (OP65_JSR, AM65_ABS, "boolugt", 0, D->OpEntry->LI);
+    InsertEntry (D, X, D->IP++);
+
+    /* Rhs load entries must be removed because Lhs must be in effect */
+    D->Rhs.X.Flags |= LI_MUST_REMOVE;
+    D->Rhs.A.Flags |= LI_MUST_REMOVE;
+
+    /* Remove the push and the call to the operator function */
+    RemoveRemainders (D);
+
+    /* We changed the sequence */
+    return 1;
+}
+
+
+
+static unsigned Opt_tosuleax (StackOpData* D)
+/* Optimize the tosuleax sequence */
+{
+    CodeEntry*  X;
+
+    /* Because of CanUseRemovableRhs */
+    CHECK (RhsIsRemovable (D));
+
+    /* Inline the sbc */
+    D->IP = D->OpIndex+1;
+
+    /* sec */
+    X = NewCodeEntry (OP65_SEC, AM65_IMP, 0, 0, D->OpEntry->LI);
+    InsertEntry (D, X, D->IP++);
+
+    /* Add code for low operand */
+    AddOpLow (D, OP65_SBC, &D->Rhs);
+
+    /* We need the zero flag, so remember the immediate result */
+    X = NewCodeEntry (OP65_STA, AM65_ZP, "tmp1", 0, D->OpEntry->LI);
+    InsertEntry (D, X, D->IP++);
+
+    /* Add code for high operand */
+    AddOpHigh (D, OP65_SBC, &D->Rhs, 0);
+
+    /* Set Z flag */
+    X = NewCodeEntry (OP65_ORA, AM65_ZP, "tmp1", 0, D->OpEntry->LI);
+    InsertEntry (D, X, D->IP++);
+
+    /* Transform to boolean */
+    X = NewCodeEntry (OP65_JSR, AM65_ABS, "boolule", 0, D->OpEntry->LI);
+    InsertEntry (D, X, D->IP++);
+
+    /* Rhs load entries must be removed because Lhs must be in effect */
+    D->Rhs.X.Flags |= LI_MUST_REMOVE;
+    D->Rhs.A.Flags |= LI_MUST_REMOVE;
+
+    /* Remove the push and the call to the operator function */
+    RemoveRemainders (D);
+
+    /* We changed the sequence */
+    return 1;
+}
+
+
+
+static unsigned Opt_tosultax (StackOpData* D)
+/* Optimize the tosultax sequence */
+{
+    CodeEntry*  X;
+
+    /* Because of CanUseRemovableRhs */
+    CHECK (RhsIsRemovable (D));
+
+    /* Inline the sbc */
+    D->IP = D->OpIndex+1;
+
+    /* Add code for low operand */
+    AddOpLow (D, OP65_CMP, &D->Rhs);
+
+    /* Add code for high operand */
+    AddOpHigh (D, OP65_SBC, &D->Rhs, 0);
+
+    /* Transform to boolean */
+    X = NewCodeEntry (OP65_JSR, AM65_ABS, "boolult", 0, D->OpEntry->LI);
+    InsertEntry (D, X, D->IP++);
+
+    /* Rhs load entries must be removed because Lhs must be in effect */
+    D->Rhs.X.Flags |= LI_MUST_REMOVE;
+    D->Rhs.A.Flags |= LI_MUST_REMOVE;
+
+    /* Remove the push and the call to the operator function */
+    RemoveRemainders (D);
+
+    /* We changed the sequence */
+    return 1;
+}
+
+
+
+static unsigned Opt_tosxorax (StackOpData* D)
+/* Optimize the tosxorax sequence */
+{
+    CodeEntry*  X;
+
+    /* HaveUnusedTempZPLoc precondition must have been met */
+    ChooseTempZPLoc (D);
+
+    /* Store the value into the zeropage instead of pushing it */
+    ReplacePushByStore (D);
+
+    /* Inline the xor, low byte */
+    D->IP = D->OpIndex + 1;
+    AddOpLow (D, OP65_EOR, &D->Lhs);
+
+    /* High byte */
+    if (RegValIsKnown (D->PushEntry->RI->In.RegX) &&
+        RegValIsKnown (D->OpEntry->RI->In.RegX)) {
+        /* Both values known, precalculate the result */
+        const char* Arg = MakeHexArg (D->PushEntry->RI->In.RegX ^ D->OpEntry->RI->In.RegX);
+        X = NewCodeEntry (OP65_LDX, AM65_IMM, Arg, 0, D->OpEntry->LI);
+        InsertEntry (D, X, D->IP++);
+    } else if (D->PushEntry->RI->In.RegX != 0) {
+        /* High byte is unknown */
+        AddOpHigh (D, OP65_EOR, &D->Lhs, 1);
+    }
+
+    /* Remove the push and the call to the tosandax function */
+    RemoveRemainders (D);
+
+    /* We changed the sequence */
+    return 1;
+}
+
+
+
+/*****************************************************************************/
+/*            Optimization functions when hi-bytes can be ignored            */
+/*****************************************************************************/
+
+
+
+static unsigned Opt_a_tosbitwise (StackOpData* D, opc_t OPC)
+/* Optimize the tosandax/tosorax/tosxorax sequence. */
+{
+    CodeEntry*  X;
+
+
+    /* Inline the bitwise operation */
+    D->IP = D->OpIndex+1;
+
+    if (RhsIsRemovable (D)) {
+
+        /* Add code for low operand using direct Rhs */
+        X = NewCodeEntry (OPC, D->Rhs.A.LoadEntry->AM, D->Rhs.A.LoadEntry->Arg, 0, D->OpEntry->LI);
+        InsertEntry (D, X, D->IP++);
+
+        /* Rhs A load must be removed because Lhs must be in effect */
+        D->Rhs.A.Flags |= (LI_REMOVE | LI_MUST_REMOVE);
+
+    } else if (RegIsDirectNonStackLoaded (&D->Lhs.A)) {
+
+        /* Add code for low operand using direct Lhs */
+        X = NewCodeEntry (OPC, D->Lhs.A.LoadEntry->AM, D->Lhs.A.LoadEntry->Arg, 0, D->OpEntry->LI);
+        InsertEntry (D, X, D->IP++);
+
+    } else {
+        /* Implement the op via a temp ZP location */
+        /* HaveUnusedTempZPLoc precondition must have been met */
+        ChooseTempZPLoc (D);
+
+        /* Backup lhs */
+        X = NewCodeEntry (OP65_STA, AM65_ZP, D->ZPLo, 0, D->PushEntry->LI);
+        InsertEntry (D, X, D->PushIndex+1);
+
+        /* Add code for low operand */
+        X = NewCodeEntry (OPC, AM65_ZP, D->ZPLo, 0, D->OpEntry->LI);
+        InsertEntry (D, X, D->IP++);
+    }
+
+    /* Note: Eager Rhs X removals here can sometimes produce slightly worse
+    **  code after all other optimizers have run. This may need a general
+    **  study of which is better: eager removal, or letting other optimizers
+    **  take care of unneeded loads.
+    */
+    /* Do high-byte operation only when its result is used */
+    if ((GetRegInfo (D->Code, D->IP, REG_X) & REG_X) != 0) {
+        /* Replace the high-byte load with 0 for EOR, or just leave it alone */
+        if (OPC == OP65_EOR) {
+            /* Since this is a "same X" EOR, the result is always 0. */
+            X = NewCodeEntry (OP65_LDX, AM65_IMM, MakeHexArg (0), 0, D->Rhs.X.ChgEntry->LI);
+            InsertEntry (D, X, D->IP++);
+
+            /* Rhs X load may be removed (but this is not a demand) */
+            D->Rhs.X.Flags |= LI_REMOVE;
+        }
+    } else {
+        /* Rhs X load may be removed (but this is not a demand) */
+        D->Rhs.X.Flags |= LI_REMOVE;
+    }
+
+    /* Remove the push and the call to the tossubax function */
+    RemoveRemainders (D);
+
+    /* We changed the sequence */
+    return 1;
+}
+
+
+
+static unsigned Opt_a_toscmpbool (StackOpData* D, const char* BoolTransformer)
+/* Optimize the TOS compare sequence with a bool transformer */
+{
+    CodeEntry* X;
+    cmp_t      Cond;
+
+    D->IP = D->OpIndex + 1;
+
+    if (RhsIsRemovable (D)) {
+
+        /* cmp */
+        AddOpLow (D, OP65_CMP, &D->Rhs);
+
+        /* Rhs low-byte load must be removed and hi-byte load may be removed */
+        D->Rhs.X.Flags |= LI_REMOVE;
+        D->Rhs.A.Flags |= LI_MUST_REMOVE;
+
+    } else if (RegIsDirectLoaded (&D->Lhs.A)) {
+        /* If the lhs is direct (but not stack relative), encode compares with lhs,
+        ** effectively reversing the order (which doesn't matter for == and !=).
+        */
+        Cond = FindBoolCmpCond (BoolTransformer);
+        Cond = GetRevertedCond (Cond);
+        BoolTransformer = GetBoolTransformer (Cond);
+
+        /* This shouldn't fail */
+        CHECK (BoolTransformer);
+
+        /* cmp */
+        AddOpLow (D, OP65_CMP, &D->Lhs);
+
+        /* Lhs load entries can be removed if not used later */
+        D->Lhs.X.Flags |= LI_REMOVE;
+        D->Lhs.A.Flags |= LI_REMOVE;
+
+    } else {
+        /* We'll do reverse-compare */
+        Cond = FindBoolCmpCond (BoolTransformer);
+        Cond = GetRevertedCond (Cond);
+        BoolTransformer = GetBoolTransformer (Cond);
+
+        /* This shouldn't fail */
+        CHECK (BoolTransformer);
+
+        /* HaveUnusedTempZPLoc precondition must have been met */
+        ChooseTempZPLoc (D);
+
+        /* Save lhs into zeropage */
+        AddStoreLhsA (D);
+        /* AddStoreLhsA may have moved the OpIndex, recalculate insertion point to prevent label migration. */
+        D->IP = D->OpIndex + 1;
+
+        /* cmp */
+        X = NewCodeEntry (OP65_CMP, AM65_ZP, D->ZPLo, 0, D->OpEntry->LI);
+        InsertEntry (D, X, D->IP++);
+
+    }
+
+    /* Create a call to the boolean transformer function. This is needed for all
+    ** variants.
+    */
+    X = NewCodeEntry (OP65_JSR, AM65_ABS, BoolTransformer, 0, D->OpEntry->LI);
+    InsertEntry (D, X, D->IP++);
+
+    /* Remove the push and the call to the TOS function */
+    RemoveRemainders (D);
+
+    /* We changed the sequence */
+    return 1;
+}
+
+
+
+static unsigned Opt_a_tosand (StackOpData* D)
+/* Optimize the tosandax sequence. */
+{
+    return Opt_a_tosbitwise (D, OP65_AND);
+}
+
+
+
+static unsigned Opt_a_toseq (StackOpData* D)
+/* Optimize the toseqax sequence */
+{
+    return Opt_a_toscmpbool (D, "booleq");
+}
+
+
+
+static unsigned Opt_a_tosicmp (StackOpData* D)
+/* Replace tosicmp with CMP */
+{
+    CodeEntry*  X;
+    RegInfo*    RI;
+    const char* Arg;
+
+    if (!SameRegAValueAtOp (D)) {
+        /* Because of SameRegAValueAtOp */
+        CHECK (D->Rhs.A.ChgIndex >= 0);
+
+        /* HaveUnusedTempZPLoc precondition must have been met */
+        ChooseTempZPLoc (D);
+
+        /* Store LHS in ZP and reload it before op */
+        X = NewCodeEntry (OP65_STA, AM65_ZP, D->ZPLo, 0, D->PushEntry->LI);
+        InsertEntry (D, X, D->PushIndex + 1);
+        X = NewCodeEntry (OP65_LDA, AM65_ZP, D->ZPLo, 0, D->PushEntry->LI);
+        InsertEntry (D, X, D->OpIndex);
+
+        D->IP = D->OpIndex + 1;
+
+        /* ### Note: This should be updated to follow the common
+        **  if (Non-Stack) { } else if (Direct) { } else { } pattern.
+        */
+        if (!RegIsDirectLoaded (&D->Rhs.A)) {
+            /* RHS src is not directly comparable */
+            X = NewCodeEntry (OP65_STA, AM65_ZP, D->ZPHi, 0, D->OpEntry->LI);
+            InsertEntry (D, X, D->Rhs.A.ChgIndex + 1);
+            /* RHS insertion may have moved the OpIndex, recalculate insertion point to prevent label migration. */
+            D->IP = D->OpIndex + 1;
+
+            /* Cmp with stored RHS */
+            X = NewCodeEntry (OP65_CMP, AM65_ZP, D->ZPHi, 0, D->OpEntry->LI);
+            InsertEntry (D, X, D->IP++);
+        } else {
+            if ((D->Rhs.A.Flags & LI_RELOAD_Y) == 0) {
+                /* ### Bug to come: This CMP uses AM65_ZP addressing mode instead
+                **  of D->Rhs.A.LoadEntry->AM. It is subtle. Assembly formatter
+                **  will not care, but other optimizers can bug because the stated
+                **  mode is incorrect. Most likely, the line was copied from
+                **  above and addressing mode never fixed.
+                */
+                /* Cmp directly with RHS src */
+                X = NewCodeEntry (OP65_CMP, AM65_ZP, D->Rhs.A.LoadEntry->Arg, 0, D->OpEntry->LI);
+                InsertEntry (D, X, D->IP++);
+            } else {
+                /* ldy #offs */
+                if ((D->Rhs.A.Flags & LI_CHECK_Y) == 0) {
+                    X = NewCodeEntry (OP65_LDY, AM65_IMM, MakeHexArg (D->Rhs.A.Offs), 0, D->OpEntry->LI);
+                } else {
+                    X = NewCodeEntry (OP65_LDY, D->Rhs.A.LoadYEntry->AM, D->Rhs.A.LoadYEntry->Arg, 0, D->OpEntry->LI);
+                }
+                InsertEntry (D, X, D->IP++);
+
+                /* cmp src,y OR cmp (c_sp),y */
+                if (D->Rhs.A.LoadEntry->OPC == OP65_JSR) {
+                    /* opc (c_sp),y */
+                    X = NewCodeEntry (OP65_CMP, AM65_ZP_INDY, "c_sp", 0, D->OpEntry->LI);
+                } else {
+                    /* opc src,y */
+                    X = NewCodeEntry (OP65_CMP, D->Rhs.A.LoadEntry->AM, D->Rhs.A.LoadEntry->Arg, 0, D->OpEntry->LI);
+                }
+                InsertEntry (D, X, D->IP++);
+            }
+
+            /* RHS may be removed, but it is not a demand because Lhs was
+            ** reloaded at Op and is in effect.
+            */
+            D->Rhs.A.Flags |= LI_REMOVE;
+            D->Rhs.X.Flags |= LI_REMOVE;
+        }
+
+        /* Fix up the N/V flags: N = ~C, V = 0 */
+        Arg = MakeHexArg (0);
+        X = NewCodeEntry (OP65_LDA, AM65_IMM, Arg, 0, D->OpEntry->LI);
+        InsertEntry (D, X, D->IP++);
+        X = NewCodeEntry (OP65_SBC, AM65_IMM, Arg, 0, D->OpEntry->LI);
+        InsertEntry (D, X, D->IP++);
+        Arg = MakeHexArg (0x01);
+        X = NewCodeEntry (OP65_ORA, AM65_IMM, Arg, 0, D->OpEntry->LI);
+        InsertEntry (D, X, D->IP++);
+
+        /* jeq L1 */
+        CodeLabel* Label = CS_GenLabel (D->Code, CS_GetEntry (D->Code, D->IP));
+        X = NewCodeEntry (OP65_JEQ, AM65_BRA, Label->Name, Label, X->LI);
+        InsertEntry (D, X, D->IP-3);
+
+    } else {
+        /* Just clear A,Z,N; and set C */
+        Arg = MakeHexArg (0);
+        if ((RI = GetLastChangedRegInfo (D, &D->Lhs.A)) != 0 &&
+            RegValIsKnown (RI->Out.RegA)                     &&
+            (RI->Out.RegA & 0xFF) == 0) {
+
+            X = NewCodeEntry (OP65_CMP, AM65_IMM, Arg, 0, D->OpEntry->LI);
+            InsertEntry (D, X, D->OpIndex + 1);
+        } else {
+            X = NewCodeEntry (OP65_LDA, AM65_IMM, Arg, 0, D->OpEntry->LI);
+            InsertEntry (D, X, D->OpIndex + 1);
+            X = NewCodeEntry (OP65_CMP, AM65_IMM, Arg, 0, D->OpEntry->LI);
+            InsertEntry (D, X, D->OpIndex + 2);
+        }
+    }
+
+    /* Remove the push and the call to the operator function */
+    RemoveRemainders (D);
+
+    return 1;
+}
+
+
+
+static unsigned Opt_a_tosne (StackOpData* D)
+/* Optimize the tosneax sequence */
+{
+    return Opt_a_toscmpbool (D, "boolne");
+}
+
+
+
+static unsigned Opt_a_tosor (StackOpData* D)
+/* Optimize the tosorax sequence. */
+{
+    return Opt_a_tosbitwise (D, OP65_ORA);
+}
+
+
+
+static unsigned Opt_a_tossub (StackOpData* D)
+/* Optimize the tossubax sequence. */
+{
+    CodeEntry*  X;
+
+    /* Because of CanUseRemovableRhs */
+    CHECK (RhsIsRemovable (D));
+
+    /* Inline the sbc */
+    D->IP = D->OpIndex+1;
+
+    /* sec */
+    X = NewCodeEntry (OP65_SEC, AM65_IMP, 0, 0, D->OpEntry->LI);
+    InsertEntry (D, X, D->IP++);
+
+    /* Add code for low operand */
+    AddOpLow (D, OP65_SBC, &D->Rhs);
+
+    /* Do sign-extension as high-byte operation only when its result is used */
+    if ((GetRegInfo (D->Code, D->IP, REG_X) & REG_X) != 0) {
+        CodeLabel* L;
+        CodeEntry* N;
+
+        X = NewCodeEntry (OP65_LDX, AM65_IMM, MakeHexArg (0), 0, D->OpEntry->LI);
+        InsertEntry (D, X, D->IP++);
+
+        /* Add sign extension - N is unused now */
+        N = CS_GetEntry (D->Code, D->IP);
+        CHECK (N != 0);
+        L = CS_GenLabel (D->Code, N);
+
+        X = NewCodeEntry (OP65_BCS, AM65_BRA, L->Name, L, D->OpEntry->LI);
+        InsertEntry (D, X, D->IP++);
+
+        X = NewCodeEntry (OP65_DEX, AM65_IMP, 0, 0, D->OpEntry->LI);
+        InsertEntry (D, X, D->IP++);
+    }
+
+    /* Rhs low-byte load must be removed (because Lhs must be in effect)
+    ** and hi-byte load may be removed.
+    */
+    D->Rhs.X.Flags |= LI_REMOVE;
+    D->Rhs.A.Flags |= LI_MUST_REMOVE;
+
+    /* Remove the push and the call to the tossubax function */
+    RemoveRemainders (D);
+
+    /* We changed the sequence */
+    return 1;
+}
+
+
+
+static unsigned Opt_a_tosuge (StackOpData* D)
+/* Optimize the tosgeax and tosugeax sequences */
+{
+    return Opt_a_toscmpbool (D, "booluge");
+}
+
+
+
+static unsigned Opt_a_tosugt (StackOpData* D)
+/* Optimize the tosgtax and tosugtax sequences */
+{
+    return Opt_a_toscmpbool (D, "boolugt");
+}
+
+
+
+static unsigned Opt_a_tosule (StackOpData* D)
+/* Optimize the tosleax and tosuleax sequences */
+{
+    return Opt_a_toscmpbool (D, "boolule");
+}
+
+
+
+static unsigned Opt_a_tosult (StackOpData* D)
+/* Optimize the tosltax and tosultax sequences */
+{
+    return Opt_a_toscmpbool (D, "boolult");
+}
+
+
+
+static unsigned Opt_a_tosxor (StackOpData* D)
+/* Optimize the tosxorax sequence. */
+{
+    return Opt_a_tosbitwise (D, OP65_EOR);
+}
+
+
+
+/*****************************************************************************/
+/*                                   Code                                    */
+/*****************************************************************************/
+
+
+
+static const OptFuncDesc* FindFunc (const OptFuncDesc FuncTable[], const char* Name)
+/* Find the function with the given name. Return a pointer to the table entry
+** or NULL if the function was not found.
+*/
+{
+    const OptFuncDesc* Desc;
+
+    /* Scan through table and find OptFuncDesc matching the Name */
+    for (Desc = FuncTable; Desc->Name != 0; ++Desc) {
+        if (strcmp (Name, Desc->Name) == 0) {
+            /* Found a match */
+            return Desc;
+        }
+    }
+
+    /* Not found */
+    return 0;
+}
+
+
+
+static int PreCondOk (StackOpData* D)
+/* Check if the preconditions for a call to the optimizer subfunction are
+** satisfied.
+*/
+{
+    const OptFuncDesc* Desc = D->OptFunc;
+
+    /* Common to all: must have a basic block */
+    if (!CS_IsBasicBlock (D->Code, D->PushIndex, D->OpIndex)) {
+        return 0; /* Fail */
+    }
+
+    /* Call the pre-cond predicate if one was provided. */
+    if (Desc->PreCond == 0 || Desc->PreCond (D)) {
+        /* Preconditions passed (even if they were null). */
+        return 1;
+    }
+
+    return 0; /* Preconditions failed */
+}
+
+
+
+/* Note: A subopt MUST commit to every use case (precondition) that it
+**  advertises in its FuncTable. Unhandled advertised cases will result in
+**  stack corruption, because OptStackOps() is committed at the point of call
+**  and cannot back out.
+*/
+
+static unsigned OptStackOps (CodeSeg* S, const OptFuncDesc FuncTable[])
+/* Optimize operations that take operands via the stack */
+{
+    unsigned        Changes = 0;        /* Number of changes in one run */
+    StackOpData     Data;
+    int             I;
+    int             OldEntryCount;      /* Old number of entries */
+    unsigned        Used;               /* What registers would be used */
+    unsigned        PushedRegs = 0;     /* Track if the same regs are used after the push */
+    int             RhsAChgIndex;       /* Track if rhs is changed more than once */
+    int             RhsXChgIndex;       /* Track if rhs is changed more than once */
+
+    enum {
+        Initialize,
+        Search,
+        FoundPush,
+        FoundOp
+    } State = Initialize;
+
+
+    /* Remember the code segment in the info struct */
+    Data.Code = S;
+
+    /* Look for a call to pushax followed by a call to some other function
+    ** that takes it's first argument on the stack, and the second argument
+    ** in the primary register.
+    ** It depends on the code between the two if we can handle/transform the
+    ** sequence, so check this code for the following list of things:
+    **
+    **  - the range must be a basic block (one entry, one exit)
+    **  - there may not be accesses to local variables with unknown
+    **    offsets (because we have to adjust these offsets).
+    **  - no subroutine calls
+    **  - no jump labels
+    **
+    ** Since we need a zero page register later, do also check the
+    ** intermediate code for zero page use.
+    ** When hibytes of both oprands are equal, we may have more specialized
+    ** optimization for the op.
+    */
+    I = 0;
+    while (I < (int)CS_GetEntryCount (S)) {
+
+        /* Get the next entry */
+        CodeEntry* E = CS_GetEntry (S, I);
+
+        /* Actions depend on state */
+        switch (State) {
+
+            case Initialize:
+                ResetStackOpData (&Data);
+                State = Search;
+                /* FALLTHROUGH */
+
+            case Search:
+                /* While searching, track register load insns, so we can tell
+                ** what is in a register once pushax is encountered.
+                */
+                if (CE_HasLabel (E)) {
+                    /* Currently we don't track across branches.
+                    ** Treat this as a change to all regs.
+                    */
+                    ClearLoadInfo (&Data.Lhs);
+                    Data.Lhs.A.ChgIndex = I;
+                    Data.Lhs.X.ChgIndex = I;
+                    Data.Lhs.Y.ChgIndex = I;
+                }
+                if (CE_IsCallTo (E, "pushax")) {
+                    /* Disallow removing Lhs loads if the registers are used */
+                    SetIfOperandLoadUnremovable (&Data.Lhs, Data.UsedRegs);
+
+                    /* The Lhs regs are also used as the default Rhs until changed */
+                    PushedRegs = REG_AXY;
+                    CopyLoadInfo (&Data.Rhs, &Data.Lhs);
+
+                    Data.PushIndex = I;
+                    Data.PushEntry = E;
+                    State = FoundPush;
+                } else {
+                    /* Track load insns */
+                    Used = TrackLoads (&Data.Lhs, S, I);
+                    Data.UsedRegs &= ~E->Chg;
+                    Data.UsedRegs |= Used;
+                }
+                break;
+
+            case FoundPush:
+                /* We' found a pushax before. Search for a stack op that may
+                ** follow and in the meantime, track zeropage usage and check
+                ** for code that will disable us from translating the sequence.
+                */
+                if (CE_HasLabel (E)) {
+                    /* Currently we don't track across branches.
+                    ** Treat this as a change to all regs.
+                    */
+                    ClearLoadInfo (&Data.Rhs);
+                    Data.Rhs.A.ChgIndex = I;
+                    Data.Rhs.X.ChgIndex = I;
+                    Data.Rhs.Y.ChgIndex = I;
+                }
+                if (E->OPC == OP65_JSR) {
+                    /* Subroutine call: Check if this is one of the functions,
+                    ** we're going to replace.
+                    */
+                    Data.OptFunc = FindFunc (FuncTable, E->Arg);
+                    if (Data.OptFunc) {
+                        /* Disallow removing Rhs loads if the registers are used */
+                        SetIfOperandLoadUnremovable (&Data.Rhs, Data.UsedRegs);
+
+                        /* Remember the op index and go on */
+                        Data.OpIndex = I;
+                        Data.OpEntry = E;
+                        State = FoundOp;
+                        break;
+                    } else if (!HarmlessCall (E, 2)) {
+                        /* The call might use or change the content that we are
+                        ** going to access later via the stack pointer. In any
+                        ** case, we need to start over after the last pushax.
+                        ** Note: This will also happen if we encounter a call
+                        ** to pushax!
+                        */
+                        I = Data.PushIndex;
+                        State = Initialize;
+                        break;
+                    }
+                } else if (((E->Chg | E->Use) & REG_SP) != 0) {
+
+                    /* If we are using the stack, and we don't have "indirect Y"
+                    ** addressing mode, or the value of Y is unknown, or less
+                    ** than two, we cannot cope with this piece of code. Having
+                    ** an unknown value of Y means that we cannot correct the
+                    ** stack offset, while having an offset less than two means
+                    ** that the code works with the value on stack which is to
+                    ** be removed.
+                    */
+                    if (E->AM == AM65_ZPX_IND               ||
+                        ((E->Chg | E->Use) & SLV_IND) == 0  ||
+                        (RegValIsUnknown (E->RI->In.RegY)   ||
+                         E->RI->In.RegY < 2)) {
+                        I = Data.PushIndex;
+                        State = Initialize;
+                        break;
+                    }
+
+                }
+
+                /* Memorize the old rhs load indices before refreshing them */
+                RhsAChgIndex = Data.Rhs.A.ChgIndex;
+                RhsXChgIndex = Data.Rhs.X.ChgIndex;
+
+                /* Keep tracking Lhs src if necessary */
+                SetIfOperandSrcAffected (&Data.Lhs, E);
+
+                /* Track register usage */
+                Used = TrackLoads (&Data.Rhs, S, I);
+
+                Data.ZPUsage   |= (E->Use | E->Chg);
+                /* The changes could depend on the use */
+                Data.UsedRegs  &= ~E->Chg;
+                Data.UsedRegs  |= Used;
+                Data.ZPChanged |= E->Chg;
+
+                /* Check if any parts of Lhs are used again before overwritten */
+                if (PushedRegs != 0) {
+                    if ((PushedRegs & E->Use) != 0) {
+                        SetIfOperandLoadUnremovable (&Data.Lhs, PushedRegs & E->Use);
+                    }
+                    PushedRegs &= ~E->Chg;
+                }
+                /* Check if rhs is changed again after the push */
+                if ((RhsAChgIndex != Data.Lhs.A.ChgIndex &&
+                     RhsAChgIndex != Data.Rhs.A.ChgIndex)       ||
+                    (RhsXChgIndex != Data.Lhs.X.ChgIndex &&
+                     RhsXChgIndex != Data.Rhs.X.ChgIndex)) {
+                    /* This will disable those sub-opts that require removing
+                    ** the rhs as they can't handle such cases correctly.
+                    */
+                    Data.RhsMultiChg = 1;
+                }
+                break;
+
+            case FoundOp:
+                /* Track zero page location usage beyond this point */
+                Data.ZPUsage |= GetRegInfo (S, I, REG_SREG | REG_PTR1 | REG_PTR2);
+
+                /* Finalize the load info */
+                FinalizeLoadInfo (&Data.Lhs, S);
+                FinalizeLoadInfo (&Data.Rhs, S);
+
+                /* Check if the lhs loads from zeropage. If this is true, these
+                ** zero page locations have to be added to ZPUsage, because
+                ** they cannot be used for intermediate storage. In addition,
+                ** if one of these zero page locations is destroyed between
+                ** pushing the lhs and the actual operation, we cannot use the
+                ** original zero page locations for the final op, but must
+                ** use another ZP location to save them.
+                */
+                Data.ZPChanged &= REG_ZP;
+                if (Data.Lhs.A.LoadEntry && Data.Lhs.A.LoadEntry->AM == AM65_ZP) {
+                    Data.ZPUsage |= Data.Lhs.A.LoadEntry->Use;
+                    if ((Data.Lhs.A.LoadEntry->Use & Data.ZPChanged) != 0) {
+                        Data.Lhs.A.Flags &= ~(LI_DIRECT | LI_RELOAD_Y);
+                    }
+                }
+                if (Data.Lhs.X.LoadEntry && Data.Lhs.X.LoadEntry->AM == AM65_ZP) {
+                    Data.ZPUsage |= Data.Lhs.X.LoadEntry->Use;
+                    if ((Data.Lhs.X.LoadEntry->Use & Data.ZPChanged) != 0) {
+                        Data.Lhs.X.Flags &= ~(LI_DIRECT | LI_RELOAD_Y);
+                    }
+                }
+
+                /* Lhs and Rhs may shared some of the load insns; or due to how
+                ** the labels are processed, "change" insns may refer to the
+                ** others' loads. In either case, it is unsafe to remove them.
+                */
+                SetUnremovableIfUsedByOther (&Data.Lhs, &Data.Rhs);
+
+                /* Flag entries that can't be removed */
+                SetDontRemoveEntryFlags (&Data);
+
+                /* Check the preconditions. If they aren't ok, reset the insn
+                ** pointer to the pushax and start over. We will lose part of
+                ** load tracking but at least a/x has probably lost between
+                ** pushax and here and will be tracked again when restarting.
+                */
+                if (!PreCondOk (&Data)) {
+                    /* Unflag entries that can't be removed */
+                    ResetDontRemoveEntryFlags (&Data);
+                    I = Data.PushIndex;
+                    State = Initialize;
+                    break;
+                }
+
+                /* Prepare the remainder of the data structure. */
+                Data.PrevEntry = CS_GetPrevEntry (S, Data.PushIndex);
+                Data.PushEntry = CS_GetEntry (S, Data.PushIndex);
+                Data.OpEntry   = CS_GetEntry (S, Data.OpIndex);
+                Data.NextEntry = CS_GetNextEntry (S, Data.OpIndex);
+
+                /* Remember the current number of code lines */
+                OldEntryCount = CS_GetEntryCount (S);
+
+                /* Adjust stack offsets to account for the upcoming removal */
+                AdjustStackOffset (&Data, 2);
+
+                /* Regenerate register info, since AdjustStackOffset changed
+                ** the code
+                */
+                CS_GenRegInfo (S);
+
+                /* Call the optimizer function */
+                const OptFuncDesc* Desc = Data.OptFunc;
+                Changes += Desc->Func (&Data);
+
+                /* Unflag entries that can't be removed */
+                ResetDontRemoveEntryFlags (&Data);
+
+                /* Since the function may have added or deleted entries,
+                ** correct the index.
+                */
+                I += CS_GetEntryCount (S) - OldEntryCount;
+
+                /* Regenerate register info */
+                CS_GenRegInfo (S);
+
+                /* Done */
+                State = Initialize;
+                continue;
+
+        }
+
+        /* Next entry */
+        ++I;
+
+    }
+
+    /* Return the number of changes made */
+    return Changes;
+}
+
+
+
+unsigned OptBZero (CodeSeg* S)
+/* Optimize __bzero operations that take operands via the stack */
+{
+    static const OptFuncDesc FuncTable[] = {
+        { "___bzero",   Opt___bzero,   WithAXlt100CanUseRegVarOrTempZP       },
+        OPTFUNCDESC_SENTINEL    /* Null-terminated list */
+    };
+
+    return OptStackOps (S, FuncTable);
+}
+
+
+
+unsigned OptPtrStore4 (CodeSeg* S)
+/* Optimize staspidx/staxspidx operations that take operands via the stack */
+{
+    static const OptFuncDesc FuncTable[] = {
+        { "staspidx",   Opt_staspidx,  CanUseRegVarOrTempZP                  },
+        { "staxspidx",  Opt_staxspidx, WithUnusedACanUseRegVarOrTempZP       },
+        OPTFUNCDESC_SENTINEL    /* Null-terminated list */
+    };
+
+    return OptStackOps (S, FuncTable);
+}
+
+
+
+unsigned OptStackArith1 (CodeSeg* S)
+/* Optimize arithmetic operations that take operands via the stack
+** where X reg has the same value on left and right sides.
+*/
+{
+    static const OptFuncDesc FuncTable[] = {
+        { "tossubax",   Opt_a_tossub,  WithSameXCanUseRemovableRhsWithTempZP },
+        OPTFUNCDESC_SENTINEL    /* Null-terminated list */
+    };
+
+    return OptStackOps (S, FuncTable);
+}
+
+
+
+unsigned OptStackArith2 (CodeSeg* S)
+/* Optimize arithmetic operations (add/sub) that take operands via the stack */
+{
+    static const OptFuncDesc FuncTable[] = {
+        { "tosaddax",   Opt_tosaddax,  MustHaveTempZP                        },
+        { "tossubax",   Opt_tossubax,  CanUseRemovableRhsWithTempZP          },
+        OPTFUNCDESC_SENTINEL    /* Null-terminated list */
+    };
+
+    return OptStackOps (S, FuncTable);
+}
+
+
+
+unsigned OptStackBitwise1 (CodeSeg* S)
+/* Optimize bitwise operations that take operands via the stack
+** where X reg has the same value on left and right sides.
+*/
+{
+    static const OptFuncDesc FuncTable[] = {
+        { "tosandax",   Opt_a_tosand,  WithSameXCanUseRemovableRhsWithTempZP },
+        { "tosorax",    Opt_a_tosor,   WithSameXCanUseRemovableRhsWithTempZP },
+        { "tosxorax",   Opt_a_tosxor,  WithSameXCanUseRemovableRhsWithTempZP },
+        OPTFUNCDESC_SENTINEL    /* Null-terminated list */
+    };
+
+    return OptStackOps (S, FuncTable);
+}
+
+
+
+unsigned OptStackBitwise2 (CodeSeg* S)
+/* Optimize bitwise operations (and/or/xor) that take operands via the stack */
+{
+    static const OptFuncDesc FuncTable[] = {
+        { "tosandax",   Opt_tosandax,  MustHaveTempZP                        },
+        { "tosorax",    Opt_tosorax,   MustHaveTempZP                        },
+        { "tosxorax",   Opt_tosxorax,  MustHaveTempZP                        },
+        OPTFUNCDESC_SENTINEL    /* Null-terminated list */
+    };
+
+    return OptStackOps (S, FuncTable);
+}
+
+
+
+unsigned OptStackEqOps1 (CodeSeg* S)
+/* Optimize ==/!= operators that take operands via the stack
+** where X reg has the same value on left and right sides.
+*/
+{
+    static const OptFuncDesc FuncTable[] = {
+        { "toseqax",    Opt_a_toseq,   WithSameXMustHaveTempZP               },
+        { "tosneax",    Opt_a_tosne,   WithSameXMustHaveTempZP               },
+        OPTFUNCDESC_SENTINEL    /* Null-terminated list */
+    };
+
+    return OptStackOps (S, FuncTable);
+}
+
+
+
+unsigned OptStackEqOps2 (CodeSeg* S)
+/* Optimize ==/!= operators that take operands via the stack */
+{
+    static const OptFuncDesc FuncTable[] = {
+        { "toseqax",    Opt_toseqax,   CanUseDirectWithRemovableRhsAndTempZP },
+        { "tosneax",    Opt_tosneax,   CanUseDirectWithRemovableRhsAndTempZP },
+        OPTFUNCDESC_SENTINEL    /* Null-terminated list */
+    };
+
+    return OptStackOps (S, FuncTable);
+}
+
+
+
+unsigned OptStackCmpOps1 (CodeSeg* S)
+/* Optimize compare operators that take operands via the stack
+** where X reg has the same value on left and right sides.
+*/
+{
+    static const OptFuncDesc FuncTable[] = {
+        { "tosgeax",    Opt_a_tosuge,  WithSameXMustHaveTempZP               },
+        { "tosgtax",    Opt_a_tosugt,  WithSameXMustHaveTempZP               },
+        { "tosleax",    Opt_a_tosule,  WithSameXMustHaveTempZP               },
+        { "tosltax",    Opt_a_tosult,  WithSameXMustHaveTempZP               },
+        { "tosugeax",   Opt_a_tosuge,  WithSameXMustHaveTempZP               },
+        { "tosugtax",   Opt_a_tosugt,  WithSameXMustHaveTempZP               },
+        { "tosuleax",   Opt_a_tosule,  WithSameXMustHaveTempZP               },
+        { "tosultax",   Opt_a_tosult,  WithSameXMustHaveTempZP               },
+        OPTFUNCDESC_SENTINEL    /* Null-terminated list */
+    };
+
+    return OptStackOps (S, FuncTable);
+}
+
+
+
+unsigned OptStackCmpOps2 (CodeSeg* S)
+/* Optimize compare operators that take operands via the stack */
+{
+    static const OptFuncDesc FuncTable[] = {
+        { "tosgeax",    Opt_tosgeax,   CanUseRemovableRhsWithTempZP          },
+        { "tosltax",    Opt_tosltax,   CanUseRemovableRhsWithTempZP          },
+        { "tosugeax",   Opt_tosugeax,  CanUseRemovableRhsWithTempZP          },
+        { "tosugtax",   Opt_tosugtax,  CanUseRemovableRhsWithTempZP          },
+        { "tosuleax",   Opt_tosuleax,  CanUseRemovableRhsWithTempZP          },
+        { "tosultax",   Opt_tosultax,  CanUseRemovableRhsWithTempZP          },
+        OPTFUNCDESC_SENTINEL    /* Null-terminated list */
+    };
+
+    return OptStackOps (S, FuncTable);
+}
+
+
+
+unsigned OptStackShifts (CodeSeg* S)
+/* Optimize shift operations that take operands via the stack */
+{
+    static const OptFuncDesc FuncTable[] = {
+        { "tosaslax",   Opt_tosaslax,  MustHaveTempZP                        },
+        { "tosasrax",   Opt_tosasrax,  MustHaveTempZP                        },
+        { "tosshlax",   Opt_tosshlax,  MustHaveTempZP                        },
+        { "tosshrax",   Opt_tosshrax,  MustHaveTempZP                        },
+        OPTFUNCDESC_SENTINEL    /* Null-terminated list */
+    };
+
+    return OptStackOps (S, FuncTable);
+}
+
+
+
+unsigned OptStackICmp1 (CodeSeg* S)
+/* Optimize tosicmp operations where X reg has the same value on
+** left and right sides.
+*/
+{
+    static const OptFuncDesc FuncTable[] = {
+        { "tosicmp",    Opt_a_tosicmp, WithSameXMustHaveTempZP               },
+        OPTFUNCDESC_SENTINEL    /* Null-terminated list */
+    };
+
+    return OptStackOps (S, FuncTable);
+}
