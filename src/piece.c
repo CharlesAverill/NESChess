@@ -120,6 +120,16 @@ routine(deselect_piece) {
     selected_i = -1;
 }
 
+void __fastcall__ move_selected_piece(val x, val y) {
+    if(selected_black) {
+        black_pieces[selected_i].x = x;
+        black_pieces[selected_i].y = y;
+    } else {
+        white_pieces[selected_i].x = x;
+        white_pieces[selected_i].y = y;
+    }
+}
+
 #define BLACK_PAL    0
 #define WHITE_PAL    1
 #define SELECTED_PAL 2
