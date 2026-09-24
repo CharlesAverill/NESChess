@@ -2,6 +2,7 @@
 #include "nesdoug.h"
 #include "controls.h"
 #include "pointer.h"
+#include "piece.h"
 #include "grid.h"
 
 static Pointer pointer;
@@ -28,6 +29,13 @@ routine(update_pointer) {
         pointer.y += 1;
     else if (triggered(DOWN) && 1 < pointer.y)
         pointer.y -= 1;
+    else if (triggered(A)) {
+        if(select_piece(pointer.x, pointer.y))
+            pointer.holding_piece = true;
+    } else if (triggered(B) && pointer.holding_piece) {
+        pointer.holding_piece = false;
+        deselect_piece();
+    }
 }
 
 static val sq_x, sq_y, tile_offset;

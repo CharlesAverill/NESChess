@@ -4,6 +4,7 @@
 
 static Piece black_pieces[16];
 static Piece white_pieces[16];
+static val selected_i;
 
 static val i;
 routine(init_pieces) {
@@ -82,11 +83,46 @@ routine(init_pieces) {
     white_pieces[i].captured = false;
     white_pieces[i].x = 4;
     white_pieces[i].y = 1;
+
+
+    selected_i = -1;
 }
 
+static bool selected_black, found;
+bool __fastcall__ select_piece(val x, val y) {
+    found = false;
 
-#define BLACK_PAL 0
-#define WHITE_PAL 1
+    for(i = 0; i < 16; i++) {
+        if (black_pieces[i].x == x && black_pieces[i].y == y) {
+            selected_i = i;
+            selected_black = true;
+            found = true;
+            break;
+        }
+    }
+
+    if (found)
+        return true;
+
+    for(i = 0; i < 16; i++) {
+        if (white_pieces[i].x == x && white_pieces[i].y == y) {
+            selected_i = i;
+            selected_black = false;
+            found = true;
+            break;
+        }
+    }
+
+    return found;
+}
+
+routine(deselect_piece) {
+    selected_i = -1;
+}
+
+#define BLACK_PAL    0
+#define WHITE_PAL    1
+#define SELECTED_PAL 2
 
 static const Piece *p;
 static val pal, px, py;
@@ -101,10 +137,16 @@ static void draw_piece(void) {
 render_routine(Pieces) {
     for(i = 0; i < 16; i++) {
         p = &black_pieces[i];
-        pal = BLACK_PAL;
+        if (i == selected_i && selected_black)
+            pal = SELECTED_PAL;
+        else
+            pal = BLACK_PAL;
         draw_piece();
         p = &white_pieces[i];
-        pal = WHITE_PAL;
+        if (i == selected_i && !selected_black)
+            pal = SELECTED_PAL;
+        else
+            pal = WHITE_PAL;
         draw_piece();
     }
 

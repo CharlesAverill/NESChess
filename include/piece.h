@@ -24,4 +24,7 @@ typedef struct Piece {
 render_routine(Pieces);
 routine(init_pieces);
 
+bool __fastcall__ select_piece(val x, val y);
+routine(deselect_piece);
+
 #endif
