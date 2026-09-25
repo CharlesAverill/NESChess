@@ -31,6 +31,7 @@ routine(init_pieces);
 Piece* __fastcall__ select_piece(val x, val y);
 Piece* __fastcall__ piece_at(val x, val y);
 void __fastcall__ move_selected_piece(val x, val y);
+void __fastcall__ move_piece_at_index(val i, bool black, val new_i);
 routine(deselect_piece);
 
 #endif

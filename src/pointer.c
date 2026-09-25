@@ -5,6 +5,7 @@
 #include "piece.h"
 #include "grid.h"
 #include "engine.h"
+#include "turn.h"
 
 static Pointer pointer;
 
@@ -21,6 +22,9 @@ routine(init_pointer) {
 
 static Piece *p;
 routine(update_pointer) {
+    if(black_turn)
+        return;
+
     if (triggered(LEFT) && 1 < pointer.x)
         pointer.x -= 1;
     else if (triggered(RIGHT) && pointer.x < BOARD_SIZE)
@@ -32,19 +36,18 @@ routine(update_pointer) {
     else if (triggered(A)) {
         if(pointer.holding_piece) {
             if (is_legal_move(pointer.holding_piece->class, pointer.holding_piece->black, pointer.holding_piece->x, pointer.holding_piece->y, pointer.x, pointer.y)) {
-                if (p = piece_at(pointer.x, pointer.y)) {
-                    p->captured = true;
-                }
                 move_selected_piece(pointer.x, pointer.y);
                 deselect_piece();
                 pointer.holding_piece = NULL;
                 needs_update = true;
+                finish_turn();
             } else {
                 pointer.holding_piece = NULL;
                 deselect_piece();
             }
-        } else if(p = select_piece(pointer.x, pointer.y))
-            pointer.holding_piece = p;
+        } else if ((p = piece_at(pointer.x, pointer.y)) && p->black == black_turn)
+            // Only pick up pieces belonging to the side to move
+            pointer.holding_piece = select_piece(pointer.x, pointer.y);
     } else if (triggered(B) && pointer.holding_piece) {
         pointer.holding_piece = NULL;
         deselect_piece();

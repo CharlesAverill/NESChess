@@ -5,6 +5,8 @@
 #include "screens/board.h"
 #include "piece.h"
 #include "pointer.h"
+#include "turn.h"
+#include "opponent.h"
 
 #define BLACK 0x0f
 #define DK_GY 0x00
@@ -38,6 +40,7 @@ const unsigned char spr_palette[]={
 void main (void) {
     init_pieces();
     init_pointer();
+    init_turn();
 
 	ppu_off();
 
@@ -54,7 +57,13 @@ void main (void) {
         read_inputs();
 
         // Updates
-        update_pointer();
+        if (black_turn)
+            opponent_move();
+        else {
+            // Step the RNG every frame
+            rand8();
+            update_pointer();
+        }
 
         // Render
         ppu_wait_nmi();

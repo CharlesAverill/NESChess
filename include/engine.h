@@ -19,5 +19,6 @@ typedef enum Occupied {
 } Occupied;
 
 bool is_legal_move(Class class, bool black, val x, val y, val tx, val ty);
+val  get_legal_moves(Class class, bool black, val x, val y);
 
 #endif

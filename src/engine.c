@@ -22,7 +22,7 @@ static Occupied _occupied(val x) {
 }
 #define occupied(x, y) _occupied(index_of_pos(x, y))
 
-// Determine the legal moves of a piece and place their indeces in legal_moves
+// Determine if a move is legal for a given piece
 static sval forward;
 static val start, end;
 static val dx, dy, cx, cy;
@@ -114,8 +114,50 @@ bool is_legal_move(Class class, bool black, val x, val y, val tx, val ty) {
     return false;
 }
 
+// Cardinal directions: {S, W, E, N,  SW, SE, NW, NE}
+static const sval dir_x[8]    = { 0, -1, 1, 0,   -1,  1, -1, 1 };
+static const sval dir_y[8]    = {-1,  0, 0, 1,   -1, -1,  1, 1 };
+// Knight directions:   {RUU, RRU, RRD, RDD, LDD, LLD, LLU, LUU}
+static const sval knight_x[8] = { 1,  2,  2,  1, -1, -2, -2, -1 };
+static const sval knight_y[8] = { 2,  1, -1, -2, -2, -1,  1,  2 };
+
 val legal_moves[30];
 static val move_idx;
+static val step_i, mx, my;
+static Occupied here;
+
+// Add each square along the rays dir_x/dir_y[first..last)
+// Stop at board edges and pieces (opponent inclusive, friendly exclusive)
+static void add_rays(bool black, val x, val y, val first, val last) {
+    opp_occupied = black ? WhiteOccupied : BlackOccupied;
+    for (step_i = first; step_i < last; step_i++) {
+        mx = x + dir_x[step_i];
+        my = y + dir_y[step_i];
+        while (mx >= 1 && mx <= 8 && my >= 1 && my <= 8) {
+            here = occupied(mx, my);
+            if (here != NotOccupied && here != opp_occupied)
+                break;
+            legal_moves[move_idx++] = index_of_pos(mx, my);
+            if (here != NotOccupied)
+                break;
+            mx += dir_x[step_i];
+            my += dir_y[step_i];
+        }
+    }
+}
+
+// Add legal moves from the offset arrays off_x and off_y
+static void add_steps(const sval *off_x, const sval *off_y, Class class, bool black, val x, val y) {
+    for (step_i = 0; step_i < 8; step_i++) {
+        mx = x + off_x[step_i];
+        my = y + off_y[step_i];
+        if (is_legal_move(class, black, x, y, mx, my))
+            legal_moves[move_idx++] = index_of_pos(mx, my);
+    }
+}
+
+// Determine the legal moves of a piece, place their board indices in
+// legal_moves, and return how many there are
 val get_legal_moves(Class class, bool black, val x, val y) {
     move_idx = 0;
 
@@ -131,6 +173,21 @@ val get_legal_moves(Class class, bool black, val x, val y) {
                 legal_moves[move_idx++] = index_of_pos(x - 1, y + forward);
             if (is_legal_move(Pawn, black, x, y, x + 1, y + forward))
                 legal_moves[move_idx++] = index_of_pos(x + 1, y + forward);
+            break;
+        case Rook:
+            add_rays(black, x, y, 0, 4);
+            break;
+        case Bishop:
+            add_rays(black, x, y, 4, 8);
+            break;
+        case Queen:
+            add_rays(black, x, y, 0, 8);
+            break;
+        case Knight:
+            add_steps(knight_x, knight_y, Knight, black, x, y);
+            break;
+        case King:
+            add_steps(dir_x, dir_y, King, black, x, y);
             break;
     }
 

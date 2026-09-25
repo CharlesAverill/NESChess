@@ -1,6 +1,7 @@
 #include "neslib.h"
 #include "piece.h"
 #include "grid.h"
+#include "engine.h"
 
 static val selected_i;
 Piece black_pieces[16];
@@ -141,14 +142,24 @@ routine(deselect_piece) {
     selected_i = -1;
 }
 
-void __fastcall__ move_selected_piece(val x, val y) {
-    if(selected_black) {
-        black_pieces[selected_i].x = x;
-        black_pieces[selected_i].y = y;
+// Move a piece to board index new_i, capturing whatever is already there
+static Piece *victim;
+void __fastcall__ move_piece_at_index(val piece_i, bool black, val new_i) {
+    victim = piece_at(posx_of_index(new_i), posy_of_index(new_i));
+    if (victim)
+        victim->captured = true;
+
+    if (black) {
+        black_pieces[piece_i].x = posx_of_index(new_i);
+        black_pieces[piece_i].y = posy_of_index(new_i);
     } else {
-        white_pieces[selected_i].x = x;
-        white_pieces[selected_i].y = y;
+        white_pieces[piece_i].x = posx_of_index(new_i);
+        white_pieces[piece_i].y = posy_of_index(new_i);
     }
+}
+
+void __fastcall__ move_selected_piece(val x, val y) {
+    move_piece_at_index(selected_i, selected_black, index_of_pos(x, y));
 }
 
 #define BLACK_PAL    0
