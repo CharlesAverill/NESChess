@@ -2,9 +2,9 @@
 #include "piece.h"
 #include "grid.h"
 
-static Piece black_pieces[16];
-static Piece white_pieces[16];
 static val selected_i;
+Piece black_pieces[16];
+Piece white_pieces[16];
 
 static val i;
 routine(init_pieces) {
@@ -14,12 +14,14 @@ routine(init_pieces) {
         black_pieces[i].captured = false;
         black_pieces[i].x = i + 1;
         black_pieces[i].y = 7;
+        black_pieces[i].black = true;
 
         white_pieces[i].class = Pawn;
         white_pieces[i].captured = false;
         white_pieces[i].x = i + 1;
         white_pieces[i].y = 2;
-    }
+        white_pieces[i].black = false;
+   }
 
     // Knights
     for(; i < 10; i++) {
@@ -27,12 +29,14 @@ routine(init_pieces) {
         black_pieces[i].captured = false;
         black_pieces[i].x = i == 8 ? 2 : 7;
         black_pieces[i].y = 8;
+        black_pieces[i].black = true;
 
         white_pieces[i].class = Knight;
         white_pieces[i].captured = false;
         white_pieces[i].x = i == 8 ? 2 : 7;
         white_pieces[i].y = 1;
-    }
+        white_pieces[i].black = false;
+   }
 
     // Bishops
     for(; i < 12; i++) {
@@ -40,12 +44,14 @@ routine(init_pieces) {
         black_pieces[i].captured = false;
         black_pieces[i].x = i == 10 ? 3 : 6;
         black_pieces[i].y = 8;
+        black_pieces[i].black = true;
 
         white_pieces[i].class = Bishop;
         white_pieces[i].captured = false;
         white_pieces[i].x = i == 10 ? 3 : 6;
         white_pieces[i].y = 1;
-    }
+        white_pieces[i].black = false;
+   }
 
     // Rooks
     for(; i < 14; i++) {
@@ -53,23 +59,27 @@ routine(init_pieces) {
         black_pieces[i].captured = false;
         black_pieces[i].x = i == 12 ? 1 : 8;
         black_pieces[i].y = 8;
+        black_pieces[i].black = true;
 
         white_pieces[i].class = Rook;
         white_pieces[i].captured = false;
         white_pieces[i].x = i == 12 ? 1 : 8;
         white_pieces[i].y = 1;
-    }
+        white_pieces[i].black = false;
+   }
 
     // Kings
     black_pieces[i].class = King;
     black_pieces[i].captured = false;
     black_pieces[i].x = 5;
     black_pieces[i].y = 8;
+    black_pieces[i].black = true;
 
     white_pieces[i].class = King;
     white_pieces[i].captured = false;
     white_pieces[i].x = 5;
     white_pieces[i].y = 1;
+    white_pieces[i].black = false;
 
     i++;
 
@@ -78,37 +88,40 @@ routine(init_pieces) {
     black_pieces[i].captured = false;
     black_pieces[i].x = 4;
     black_pieces[i].y = 8;
+    black_pieces[i].black = true;
 
     white_pieces[i].class = Queen;
     white_pieces[i].captured = false;
     white_pieces[i].x = 4;
     white_pieces[i].y = 1;
+    white_pieces[i].black = false;
 
 
     selected_i = -1;
 }
 
-static bool selected_black, found;
-bool __fastcall__ select_piece(val x, val y) {
-    found = false;
+static bool selected_black;
+static Piece* found;
+Piece* __fastcall__ select_piece(val x, val y) {
+    found = NULL;
 
     for(i = 0; i < 16; i++) {
         if (black_pieces[i].x == x && black_pieces[i].y == y) {
             selected_i = i;
             selected_black = true;
-            found = true;
+            found = &black_pieces[i];
             break;
         }
     }
 
     if (found)
-        return true;
+        return found;
 
     for(i = 0; i < 16; i++) {
         if (white_pieces[i].x == x && white_pieces[i].y == y) {
             selected_i = i;
             selected_black = false;
-            found = true;
+            found = &white_pieces[i];
             break;
         }
     }
@@ -152,6 +165,7 @@ render_routine(Pieces) {
         else
             pal = BLACK_PAL;
         draw_piece();
+
         p = &white_pieces[i];
         if (i == selected_i && !selected_black)
             pal = SELECTED_PAL;

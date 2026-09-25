@@ -4,6 +4,7 @@
 #include "pointer.h"
 #include "piece.h"
 #include "grid.h"
+#include "engine.h"
 
 static Pointer pointer;
 
@@ -12,14 +13,13 @@ static val drawn_x, drawn_y;
 routine(init_pointer) {
     pointer.x = 5;
     pointer.y = 3;
-    pointer.holding_piece = false;
-    pointer.held_x = 0;
-    pointer.held_y = 0;
+    pointer.holding_piece = NULL;
 
     drawn_x = 0;
     drawn_y = 0;
 }
 
+static Piece *p;
 routine(update_pointer) {
     if (triggered(LEFT) && 1 < pointer.x)
         pointer.x -= 1;
@@ -31,13 +31,19 @@ routine(update_pointer) {
         pointer.y -= 1;
     else if (triggered(A)) {
         if(pointer.holding_piece) {
-            move_selected_piece(pointer.x, pointer.y);
-            deselect_piece();
-            pointer.holding_piece = false;
-        } else if(select_piece(pointer.x, pointer.y))
-            pointer.holding_piece = true;
+            if (is_legal_move(pointer.holding_piece->class, pointer.holding_piece->black, pointer.holding_piece->x, pointer.holding_piece->y, pointer.x, pointer.y)) {
+                move_selected_piece(pointer.x, pointer.y);
+                deselect_piece();
+                pointer.holding_piece = NULL;
+                needs_update = true;
+            } else {
+                pointer.holding_piece = NULL;
+                deselect_piece();
+            }
+        } else if(p = select_piece(pointer.x, pointer.y))
+            pointer.holding_piece = p;
     } else if (triggered(B) && pointer.holding_piece) {
-        pointer.holding_piece = false;
+        pointer.holding_piece = NULL;
         deselect_piece();
     }
 }

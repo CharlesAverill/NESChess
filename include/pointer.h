@@ -2,13 +2,13 @@
 #define POINTER_H
 
 #include "types.h"
+#include "piece.h"
 
 typedef struct Pointer {
     val x, y;
 
     // Piece currently held by pointer
-    bool holding_piece;
-    val held_x, held_y;
+    Piece *holding_piece;
 } Pointer;
 
 routine(init_pointer);

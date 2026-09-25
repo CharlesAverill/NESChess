@@ -17,14 +17,18 @@ typedef enum Class {
 
 typedef struct Piece {
     Class class;
+    bool black;
     bool captured;
     val x, y;
 } Piece;
 
+extern Piece black_pieces[16];
+extern Piece white_pieces[16];
+
 render_routine(Pieces);
 routine(init_pieces);
 
-bool __fastcall__ select_piece(val x, val y);
+Piece* __fastcall__ select_piece(val x, val y);
 void __fastcall__ move_selected_piece(val x, val y);
 routine(deselect_piece);
 
