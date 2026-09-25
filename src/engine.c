@@ -4,7 +4,7 @@
 bool needs_update = true;
 
 static Occupied board[64];
-static val i;
+static val i, j;
 static routine(update_occupied) {
     memset(board, NotOccupied, 64);
     for (i = 0; i < 16; i++) {
@@ -24,12 +24,18 @@ static Occupied _occupied(val x) {
 
 // Determine the legal moves of a piece and place their indeces in legal_moves
 static sval forward;
+static val start, end;
+static val dx, dy, cx, cy;
+static sval step_x, step_y;
+static Occupied opp_occupied;
 bool is_legal_move(Class class, bool black, val x, val y, val tx, val ty) {
-    switch(class) {
-        case Pawn:
-            if (tx < 1 || tx > 8 || ty < 1 || ty > 8)
-                return false;
+    if (tx < 1 || tx > 8 || ty < 1 || ty > 8)
+        return false;
 
+    opp_occupied = black ? WhiteOccupied : BlackOccupied;
+
+    switch(class) {
+        case Pawn:   
             forward = black ? -1 : 1;
             // One step forward
             if (x == tx && y + forward == ty && occupied(tx, ty) == NotOccupied)
@@ -41,9 +47,66 @@ bool is_legal_move(Class class, bool black, val x, val y, val tx, val ty) {
                 return true;
             // Diagonal
             if ((x == tx + 1 || x == tx - 1) && y + forward == ty &&
-                    occupied(tx, ty) == (black ? WhiteOccupied : BlackOccupied))
+                    occupied(tx, ty) == opp_occupied)
                 return true;
             break;
+        case Rook:
+            if (x == tx && y == ty)
+                return false;
+
+            // Check verticals
+            if (x == tx) {
+                start = (y < ty ? y : ty) + 1;
+                end = y < ty ? ty : y;
+                for(j = start; j < end; j++) {
+                    if (occupied(x, j) != NotOccupied)
+                        return false;
+                }
+            } else if (y == ty) { // Check horizontals
+                start = (x < tx ? x : tx) + 1;
+                end = x < tx ? tx : x;
+                for(j = start; j < end; j++) {
+                    if (occupied(j, y) != NotOccupied)
+                        return false;
+                }
+            } else
+                return false;
+
+            return occupied(tx, ty) == NotOccupied || occupied(tx, ty) == opp_occupied;
+        case Bishop:
+            dx = x < tx ? tx - x : x - tx;
+            dy = y < ty ? ty - y : y - ty;
+            if (dx == 0 || dx != dy)
+                return false;
+
+            step_x = x < tx ? 1 : -1;
+            step_y = y < ty ? 1 : -1;
+            cx = x + step_x;
+            cy = y + step_y;
+            while (cx != tx) {
+                if (occupied(cx, cy) != NotOccupied)
+                    return false;
+                cx += step_x;
+                cy += step_y;
+            }
+
+            return occupied(tx, ty) == NotOccupied || occupied(tx, ty) == opp_occupied;
+        case Knight:
+            dx = x < tx ? tx - x : x - tx;
+            dy = y < ty ? ty - y : y - ty;
+            if (!((dx == 1 && dy == 2) || (dx == 2 && dy == 1)))
+                return false;
+
+            return occupied(tx, ty) == NotOccupied || occupied(tx, ty) == opp_occupied;
+        case Queen:
+            return is_legal_move(Rook, black, x, y, tx, ty) ||
+                   is_legal_move(Bishop, black, x, y, tx, ty);
+        case King:
+            if (x == tx && y == ty)
+                return false;
+            return ((x == tx - 1 || x == tx || x == tx + 1) &&
+                    (y == ty - 1 || y == ty || y == ty + 1) &&
+                    (occupied(tx, ty) == NotOccupied || occupied(tx, ty) == opp_occupied));
         default:
             return false;
     }

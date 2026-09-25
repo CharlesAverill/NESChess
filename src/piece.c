@@ -102,13 +102,14 @@ routine(init_pieces) {
 
 static bool selected_black;
 static Piece* found;
-Piece* __fastcall__ select_piece(val x, val y) {
+static val found_i;
+// Find the uncaptured piece on (x, y)
+Piece* __fastcall__ piece_at(val x, val y) {
     found = NULL;
 
     for(i = 0; i < 16; i++) {
-        if (black_pieces[i].x == x && black_pieces[i].y == y) {
-            selected_i = i;
-            selected_black = true;
+        if (!black_pieces[i].captured && black_pieces[i].x == x && black_pieces[i].y == y) {
+            found_i = i;
             found = &black_pieces[i];
             break;
         }
@@ -118,14 +119,21 @@ Piece* __fastcall__ select_piece(val x, val y) {
         return found;
 
     for(i = 0; i < 16; i++) {
-        if (white_pieces[i].x == x && white_pieces[i].y == y) {
-            selected_i = i;
-            selected_black = false;
+        if (!white_pieces[i].captured && white_pieces[i].x == x && white_pieces[i].y == y) {
+            found_i = i;
             found = &white_pieces[i];
             break;
         }
     }
 
+    return found;
+}
+
+Piece* __fastcall__ select_piece(val x, val y) {
+    if(!piece_at(x, y))
+        return NULL;
+    selected_i = found_i;
+    selected_black = found->black;
     return found;
 }
 

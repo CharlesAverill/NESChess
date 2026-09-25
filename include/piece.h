@@ -29,6 +29,7 @@ render_routine(Pieces);
 routine(init_pieces);
 
 Piece* __fastcall__ select_piece(val x, val y);
+Piece* __fastcall__ piece_at(val x, val y);
 void __fastcall__ move_selected_piece(val x, val y);
 routine(deselect_piece);
 

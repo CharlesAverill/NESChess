@@ -32,6 +32,9 @@ routine(update_pointer) {
     else if (triggered(A)) {
         if(pointer.holding_piece) {
             if (is_legal_move(pointer.holding_piece->class, pointer.holding_piece->black, pointer.holding_piece->x, pointer.holding_piece->y, pointer.x, pointer.y)) {
+                if (p = piece_at(pointer.x, pointer.y)) {
+                    p->captured = true;
+                }
                 move_selected_piece(pointer.x, pointer.y);
                 deselect_piece();
                 pointer.holding_piece = NULL;
